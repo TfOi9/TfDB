@@ -3,6 +3,7 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "config.hpp"
 #include "page.hpp"
@@ -16,9 +17,13 @@ BPT_TEMPLATE_ARGS
 class BPlusTree {
 private:
     BUFFER_MANAGER_TYPE buffer_;
-    std::shared_ptr<const PAGE_TYPE> cur_;
-    diskpos_t pos_;
+    PAGE_TYPE cur_;
+    diskpos_t pos_ = 0;
     diskpos_t root_ = 0;
+
+    void read_page_copy(diskpos_t pos, PAGE_TYPE &page);
+
+    void write_page_copy(diskpos_t pos, const PAGE_TYPE &page);
 
     void split();
 
@@ -51,6 +56,18 @@ BPT_TYPE::BPlusTree(const std::string file_name) : buffer_(CACHE_CAPACITY, file_
 }
 
 BPT_TEMPLATE_ARGS
+void BPT_TYPE::read_page_copy(diskpos_t pos, PAGE_TYPE &page) {
+    auto guard = buffer_.read_page(pos);
+    page = guard.get_page();
+}
+
+BPT_TEMPLATE_ARGS
+void BPT_TYPE::write_page_copy(diskpos_t pos, const PAGE_TYPE &page) {
+    auto guard = buffer_.write_page(pos);
+    guard.get_page() = page;
+}
+
+BPT_TEMPLATE_ARGS
 BPT_TYPE::~BPlusTree() {
     buffer_.set_root_pos(root_);
 }
@@ -61,17 +78,17 @@ std::optional<ValueType> BPT_TYPE::find(const KeyType& key) {
         return std::nullopt;
     }
     pos_ = root_;
-    cur_ = buffer_.get_page(pos_);
-    while (cur_->type_ != PageType::Leaf) {
-        int k = cur_->lower_bound(key);
-        pos_ = cur_->ch_[k];
-        cur_ = buffer_.get_page(pos_);
+    read_page_copy(pos_, cur_);
+    while (cur_.type_ != PageType::Leaf) {
+        int k = cur_.lower_bound(key);
+        pos_ = cur_.ch_[k];
+        read_page_copy(pos_, cur_);
     }
-    int k = cur_->lower_bound(key);
-    if (cur_->data_[k].key_ != key) {
+    int k = cur_.lower_bound(key);
+    if (cur_.data_[k].key_ != key) {
         return std::nullopt;
     }
-    return cur_->data_[k].val_;
+    return cur_.data_[k].val_;
 }
 
 BPT_TEMPLATE_ARGS
@@ -81,29 +98,29 @@ void BPT_TYPE::find_all(const KeyType& key, std::vector<ValueType>& vec) {
         return;
     }
     pos_ = root_;
-    cur_ = buffer_.get_page(pos_);
-    while (cur_->type_ != PageType::Leaf) {
-        int k = cur_->lower_bound(key);
-        pos_ = cur_->ch_[k];
-        cur_ = buffer_.get_page(pos_);
+    read_page_copy(pos_, cur_);
+    while (cur_.type_ != PageType::Leaf) {
+        int k = cur_.lower_bound(key);
+        pos_ = cur_.ch_[k];
+        read_page_copy(pos_, cur_);
     }
-    int k = cur_->lower_bound(key);
-    if (cur_->data_[k].key_ != key) {
+    int k = cur_.lower_bound(key);
+    if (cur_.data_[k].key_ != key) {
         return;
     }
     int curk = k;
-    while (cur_->data_[curk].key_ == key) {
-        vec.push_back(cur_->data_[curk].val_);
-        if (curk < cur_->size_ - 1) {
+    while (cur_.data_[curk].key_ == key) {
+        vec.push_back(cur_.data_[curk].val_);
+        if (curk < static_cast<int>(cur_.size_) - 1) {
             curk++;
         }
         else {
-            if (cur_->right_ == -1) {
+            if (cur_.right_ == -1) {
                 break;
             }
             else {
-                pos_ = cur_->right_;
-                cur_ = buffer_.get_page(pos_);
+                pos_ = cur_.right_;
+                read_page_copy(pos_, cur_);
                 curk = 0;
             }
         }
@@ -114,49 +131,59 @@ BPT_TEMPLATE_ARGS
 void BPT_TYPE::split() {
     PAGE_TYPE newp;
     newp.size_ = PAGE_SLOT_COUNT / 2;
-    auto cur_mut = buffer_.get_page_mutable(pos_);
-    diskpos_t cur_pos = pos_;
-    diskpos_t parent_pos = cur_mut->fa_;
-    cur_mut->size_ = PAGE_SLOT_COUNT / 2;
-    if (cur_mut->type_ == PageType::Leaf) {
+    cur_.size_ = PAGE_SLOT_COUNT / 2;
+    if (cur_.type_ == PageType::Leaf) {
         newp.type_ = PageType::Leaf;
     }
     else {
         newp.type_ = PageType::Internal;
     }
-    newp.fa_ = parent_pos;
-    newp.left_ = cur_pos;
-    newp.right_ = cur_mut->right_;
-    if (cur_mut->type_ == PageType::Leaf) {
-        for (int i = 0; i < newp.size_; i++) {
-            newp.data_[i] = cur_mut->data_[i + newp.size_];
+    newp.fa_ = cur_.fa_;
+    newp.left_ = pos_;
+    newp.right_ = cur_.right_;
+
+    if (cur_.type_ == PageType::Leaf) {
+        for (int i = 0; i < static_cast<int>(newp.size_); i++) {
+            newp.data_[i] = cur_.data_[i + static_cast<int>(newp.size_)];
         }
-        KEYPAIR_TYPE split_at = cur_mut->back();
+
+        KEYPAIR_TYPE split_at = cur_.back();
         KEYPAIR_TYPE max_pair = newp.back();
-        if (parent_pos != -1) {
-            auto f = buffer_.get_page_mutable(parent_pos);
-            diskpos_t fa_pos = f->lower_bound(max_pair);
-            for (int i = f->size_ - 1; i >= fa_pos; i--) {
-                f->data_[i + 1] = f->data_[i];
-                f->ch_[i + 1] = f->ch_[i];
+
+        if (cur_.fa_ != -1) {
+            PAGE_TYPE f;
+            read_page_copy(cur_.fa_, f);
+
+            int fa_pos = f.lower_bound(max_pair);
+            for (int i = static_cast<int>(f.size_) - 1; i >= fa_pos; i--) {
+                f.data_[i + 1] = f.data_[i];
+                f.ch_[i + 1] = f.ch_[i];
             }
+
             diskpos_t newp_pos = buffer_.insert_page(newp);
-            f->data_[fa_pos] = split_at;
-            f->data_[fa_pos + 1] = max_pair;
-            f->ch_[fa_pos] = cur_pos;
-            f->ch_[fa_pos + 1] = newp_pos;
-            f->size_++;
-            if (cur_mut->right_ != -1) {
-                auto rp = buffer_.get_page_mutable(cur_mut->right_);
-                rp->left_ = newp_pos;
-                buffer_.finish_use(cur_mut->right_);
+
+            f.data_[fa_pos] = split_at;
+            f.data_[fa_pos + 1] = max_pair;
+            f.ch_[fa_pos] = pos_;
+            f.ch_[fa_pos + 1] = newp_pos;
+            f.size_++;
+
+            if (cur_.right_ != -1) {
+                PAGE_TYPE rp;
+                read_page_copy(cur_.right_, rp);
+                rp.left_ = newp_pos;
+                write_page_copy(cur_.right_, rp);
             }
-            cur_mut->right_ = newp_pos;
-            bool need_split_parent = (f->size_ == PAGE_SLOT_COUNT);
-            buffer_.finish_use(parent_pos);
-            buffer_.finish_use(cur_pos);
+
+            cur_.right_ = newp_pos;
+            bool need_split_parent = (f.size_ == PAGE_SLOT_COUNT);
+
+            write_page_copy(cur_.fa_, f);
+            write_page_copy(pos_, cur_);
+
             if (need_split_parent) {
-                pos_ = parent_pos;
+                pos_ = cur_.fa_;
+                cur_ = f;
                 split();
             }
         }
@@ -166,57 +193,74 @@ void BPT_TYPE::split() {
             newr.size_ = 2;
             newr.data_[0] = split_at;
             newr.data_[1] = max_pair;
-            newr.ch_[0] = cur_pos;
+            newr.ch_[0] = pos_;
+
             diskpos_t newp_pos = buffer_.insert_page(newp);
             newr.ch_[1] = newp_pos;
-            cur_mut->right_ = newp_pos;
+
+            cur_.right_ = newp_pos;
             root_ = buffer_.insert_page(newr);
-            cur_mut->fa_ = root_;
-            auto newp_mut = buffer_.get_page_mutable(newp_pos);
-            newp_mut->fa_ = root_;
-            buffer_.finish_use(newp_pos);
-            buffer_.finish_use(cur_pos);
+
+            cur_.fa_ = root_;
+            newp.fa_ = root_;
+
+            write_page_copy(pos_, cur_);
+            write_page_copy(newp_pos, newp);
         }
+
         return;
     }
 
+    for (int i = 0; i < static_cast<int>(newp.size_); i++) {
+        newp.data_[i] = cur_.data_[i + static_cast<int>(newp.size_)];
+        newp.ch_[i] = cur_.ch_[i + static_cast<int>(newp.size_)];
+    }
+
     diskpos_t newp_pos = buffer_.insert_page(newp);
-    auto newp_mut = buffer_.get_page_mutable(newp_pos);
-    for (int i = 0; i < newp_mut->size_; i++) {
-        newp_mut->data_[i] = cur_mut->data_[i + newp_mut->size_];
-        newp_mut->ch_[i] = cur_mut->ch_[i + newp_mut->size_];
+
+    for (int i = 0; i < static_cast<int>(newp.size_); i++) {
+        PAGE_TYPE ch;
+        read_page_copy(newp.ch_[i], ch);
+        ch.fa_ = newp_pos;
+        write_page_copy(newp.ch_[i], ch);
     }
-    for (int i = 0; i < newp_mut->size_; i++) {
-        auto ch = buffer_.get_page_mutable(newp_mut->ch_[i]);
-        ch->fa_ = newp_pos;
-        buffer_.finish_use(newp_mut->ch_[i]);
-    }
-    KEYPAIR_TYPE split_at = cur_mut->back();
-    KEYPAIR_TYPE max_pair = newp_mut->back();
-    if (parent_pos != -1) {
-        auto f = buffer_.get_page_mutable(parent_pos);
-        diskpos_t fa_pos = f->lower_bound(max_pair);
-        for (int i = f->size_ - 1; i >= fa_pos; i--) {
-            f->data_[i + 1] = f->data_[i];
-            f->ch_[i + 1] = f->ch_[i];
+
+    KEYPAIR_TYPE split_at = cur_.back();
+    KEYPAIR_TYPE max_pair = newp.back();
+
+    if (cur_.fa_ != -1) {
+        PAGE_TYPE f;
+        read_page_copy(cur_.fa_, f);
+
+        int fa_pos = f.lower_bound(max_pair);
+        for (int i = static_cast<int>(f.size_) - 1; i >= fa_pos; i--) {
+            f.data_[i + 1] = f.data_[i];
+            f.ch_[i + 1] = f.ch_[i];
         }
-        f->data_[fa_pos] = split_at;
-        f->data_[fa_pos + 1] = max_pair;
-        f->ch_[fa_pos] = cur_pos;
-        f->ch_[fa_pos + 1] = newp_pos;
-        f->size_++;
-        if (cur_mut->right_ != -1) {
-            auto rp = buffer_.get_page_mutable(cur_mut->right_);
-            rp->left_ = newp_pos;
-            buffer_.finish_use(cur_mut->right_);
+
+        f.data_[fa_pos] = split_at;
+        f.data_[fa_pos + 1] = max_pair;
+        f.ch_[fa_pos] = pos_;
+        f.ch_[fa_pos + 1] = newp_pos;
+        f.size_++;
+
+        if (cur_.right_ != -1) {
+            PAGE_TYPE rp;
+            read_page_copy(cur_.right_, rp);
+            rp.left_ = newp_pos;
+            write_page_copy(cur_.right_, rp);
         }
-        cur_mut->right_ = newp_pos;
-        bool need_split_parent = (f->size_ == PAGE_SLOT_COUNT);
-        buffer_.finish_use(parent_pos);
-        buffer_.finish_use(cur_pos);
-        buffer_.finish_use(newp_pos);
+
+        cur_.right_ = newp_pos;
+        bool need_split_parent = (f.size_ == PAGE_SLOT_COUNT);
+
+        write_page_copy(cur_.fa_, f);
+        write_page_copy(pos_, cur_);
+        write_page_copy(newp_pos, newp);
+
         if (need_split_parent) {
-            pos_ = parent_pos;
+            pos_ = cur_.fa_;
+            cur_ = f;
             split();
         }
     }
@@ -226,13 +270,16 @@ void BPT_TYPE::split() {
         newr.size_ = 2;
         newr.data_[0] = split_at;
         newr.data_[1] = max_pair;
-        newr.ch_[0] = cur_pos;
+        newr.ch_[0] = pos_;
         newr.ch_[1] = newp_pos;
+
         root_ = buffer_.insert_page(newr);
-        cur_mut->fa_ = root_;
-        newp_mut->fa_ = root_;
-        buffer_.finish_use(cur_pos);
-        buffer_.finish_use(newp_pos);
+
+        cur_.fa_ = root_;
+        newp.fa_ = root_;
+
+        write_page_copy(pos_, cur_);
+        write_page_copy(newp_pos, newp);
     }
 }
 
@@ -247,38 +294,41 @@ void BPT_TYPE::insert(const KeyType& key, const ValueType& val) {
         root_ = buffer_.insert_page(newr);
         return;
     }
+
     pos_ = root_;
-    cur_ = buffer_.get_page(pos_);
-    while (cur_->type_ != PageType::Leaf) {
-        auto cur_mut = buffer_.get_page_mutable(pos_);
-        int k = cur_mut->lower_bound(kp);
-        if (cur_mut->data_[k] < kp) {
-            cur_mut->data_[k] = kp;
+    read_page_copy(pos_, cur_);
+
+    while (cur_.type_ != PageType::Leaf) {
+        int k = cur_.lower_bound(kp);
+        if (cur_.data_[k] < kp) {
+            cur_.data_[k] = kp;
+            write_page_copy(pos_, cur_);
         }
-        diskpos_t child = cur_mut->ch_[k];
-        buffer_.finish_use(pos_);
-        pos_ = child;
-        cur_ = buffer_.get_page(pos_);
+
+        pos_ = cur_.ch_[k];
+        read_page_copy(pos_, cur_);
     }
-    auto cur_mut = buffer_.get_page_mutable(pos_);
-    int k = cur_mut->lower_bound(kp);
-    if (cur_mut->data_[k] == kp) {
-        buffer_.finish_use(pos_);
+
+    int k = cur_.lower_bound(kp);
+    if (cur_.data_[k] == kp) {
         return;
     }
-    if (cur_mut->data_[k] < kp) {
-        cur_mut->data_[k + 1] = kp;
-        cur_mut->size_++;
+
+    if (cur_.data_[k] < kp) {
+        cur_.data_[k + 1] = kp;
+        cur_.size_++;
     }
     else {
-        for (int i = static_cast<int>(cur_mut->size_) - 1; i >= k; i--) {
-            cur_mut->data_[i + 1] = cur_mut->data_[i];
+        for (int i = static_cast<int>(cur_.size_) - 1; i >= k; i--) {
+            cur_.data_[i + 1] = cur_.data_[i];
         }
-        cur_mut->data_[k] = kp;
-        cur_mut->size_++;
+        cur_.data_[k] = kp;
+        cur_.size_++;
     }
-    bool need_split = (cur_mut->size_ == PAGE_SLOT_COUNT);
-    buffer_.finish_use(pos_);
+
+    write_page_copy(pos_, cur_);
+
+    bool need_split = (cur_.size_ == PAGE_SLOT_COUNT);
     if (need_split) {
         split();
     }
@@ -289,44 +339,48 @@ void BPT_TYPE::erase(const KeyType& key, const ValueType& val) {
     if (root_ == 0) {
         return;
     }
+
     KEYPAIR_TYPE kp(key, val);
     pos_ = root_;
-    cur_ = buffer_.get_page(pos_);
-    while (cur_->type_ != PageType::Leaf) {
-        int k = cur_->lower_bound(kp);
-        pos_ = cur_->ch_[k];
-        cur_ = buffer_.get_page(pos_);
+
+    read_page_copy(pos_, cur_);
+    while (cur_.type_ != PageType::Leaf) {
+        int k = cur_.lower_bound(kp);
+        pos_ = cur_.ch_[k];
+        read_page_copy(pos_, cur_);
     }
-    auto cur_mut = buffer_.get_page_mutable(pos_);
-    int k = cur_mut->lower_bound(kp);
-    if (cur_mut->data_[k] != kp) {
-        buffer_.finish_use(pos_);
+
+    int k = cur_.lower_bound(kp);
+    if (cur_.data_[k] != kp) {
         return;
     }
-    for (int i = k; i < static_cast<int>(cur_mut->size_) - 1; i++) {
-        cur_mut->data_[i] = cur_mut->data_[i + 1];
+
+    for (int i = k; i < static_cast<int>(cur_.size_) - 1; i++) {
+        cur_.data_[i] = cur_.data_[i + 1];
     }
-    cur_mut->size_--;
-    KEYPAIR_TYPE max_pair = cur_mut->back();
-    diskpos_t cur_pos = pos_;
-    diskpos_t fpos = cur_mut->fa_;
-    buffer_.finish_use(cur_pos);
+
+    cur_.size_--;
+    write_page_copy(pos_, cur_);
+
+    KEYPAIR_TYPE max_pair = cur_.back();
+    diskpos_t fpos = cur_.fa_;
+
     while (fpos != -1) {
-        auto f = buffer_.get_page_mutable(fpos);
-        int p = f->lower_bound(kp);
-        diskpos_t next_parent = f->fa_;
-        if (f->data_[p] == kp) {
-            f->data_[p] = max_pair;
-            buffer_.finish_use(fpos);
-            fpos = next_parent;
+        PAGE_TYPE f;
+        read_page_copy(fpos, f);
+
+        int p = f.lower_bound(kp);
+        if (f.data_[p] == kp) {
+            f.data_[p] = max_pair;
+            write_page_copy(fpos, f);
+            fpos = f.fa_;
         }
         else {
-            buffer_.finish_use(fpos);
             break;
         }
     }
-    auto check_cur = buffer_.get_page(pos_);
-    bool need_balance = (check_cur->size_ < PAGE_SLOT_COUNT / 2);
+
+    bool need_balance = (cur_.size_ < PAGE_SLOT_COUNT / 2);
     if (need_balance) {
         balance();
     }
@@ -334,205 +388,240 @@ void BPT_TYPE::erase(const KeyType& key, const ValueType& val) {
 
 BPT_TEMPLATE_ARGS
 bool BPT_TYPE::borrowl() {
-    auto cur_mut = buffer_.get_page_mutable(pos_);
-    diskpos_t cur_pos = pos_;
-    if (cur_mut->fa_ == -1 || cur_mut->size_ == 0) {
-        buffer_.finish_use(cur_pos);
+    if (cur_.fa_ == -1 || cur_.size_ == 0) {
         return false;
     }
-    diskpos_t fpos = cur_mut->fa_;
-    KEYPAIR_TYPE max_pair = cur_mut->back();
-    auto f = buffer_.get_page_mutable(fpos);
-    int k = f->lower_bound(max_pair);
+
+    diskpos_t fpos = cur_.fa_;
+    KEYPAIR_TYPE max_pair = cur_.back();
+
+    PAGE_TYPE f;
+    read_page_copy(fpos, f);
+
+    int k = f.lower_bound(max_pair);
     if (k == 0) {
-        buffer_.finish_use(fpos);
-        buffer_.finish_use(cur_pos);
         return false;
     }
-    diskpos_t bpos = f->ch_[k - 1];
-    auto bro = buffer_.get_page_mutable(bpos);
-    if (bro->size_ <= PAGE_SLOT_COUNT / 2) {
-        buffer_.finish_use(bpos);
-        buffer_.finish_use(fpos);
-        buffer_.finish_use(cur_pos);
+
+    diskpos_t bpos = f.ch_[k - 1];
+    PAGE_TYPE bro;
+    read_page_copy(bpos, bro);
+
+    if (bro.size_ <= PAGE_SLOT_COUNT / 2) {
         return false;
     }
-    for (int i = static_cast<int>(cur_mut->size_) - 1; i >= 0; i--) {
-        cur_mut->data_[i + 1] = cur_mut->data_[i];
-        cur_mut->ch_[i + 1] = cur_mut->ch_[i];
+
+    for (int i = static_cast<int>(cur_.size_) - 1; i >= 0; i--) {
+        cur_.data_[i + 1] = cur_.data_[i];
+        cur_.ch_[i + 1] = cur_.ch_[i];
     }
-    cur_mut->data_[0] = bro->back();
-    cur_mut->ch_[0] = bro->ch_[bro->size_ - 1];
-    cur_mut->size_++;
-    bro->size_--;
-    if (cur_mut->type_ == PageType::Internal) {
-        auto son = buffer_.get_page_mutable(cur_mut->ch_[0]);
-        son->fa_ = cur_pos;
-        buffer_.finish_use(cur_mut->ch_[0]);
+
+    cur_.data_[0] = bro.back();
+    cur_.ch_[0] = bro.ch_[bro.size_ - 1];
+    cur_.size_++;
+    bro.size_--;
+
+    if (cur_.type_ == PageType::Internal) {
+        PAGE_TYPE son;
+        read_page_copy(cur_.ch_[0], son);
+        son.fa_ = pos_;
+        write_page_copy(cur_.ch_[0], son);
     }
-    f->data_[k - 1] = bro->back();
-    buffer_.finish_use(bpos);
-    buffer_.finish_use(fpos);
-    buffer_.finish_use(cur_pos);
+
+    f.data_[k - 1] = bro.back();
+
+    write_page_copy(pos_, cur_);
+    write_page_copy(bpos, bro);
+    write_page_copy(fpos, f);
+
     return true;
 }
 
 BPT_TEMPLATE_ARGS
 bool BPT_TYPE::borrowr() {
-    auto cur_mut = buffer_.get_page_mutable(pos_);
-    diskpos_t cur_pos = pos_;
-    if (cur_mut->fa_ == -1 || cur_mut->size_ == 0) {
-        buffer_.finish_use(cur_pos);
+    if (cur_.fa_ == -1 || cur_.size_ == 0) {
         return false;
     }
-    diskpos_t fpos = cur_mut->fa_;
-    KEYPAIR_TYPE max_pair = cur_mut->back();
-    auto f = buffer_.get_page_mutable(fpos);
-    int k = f->lower_bound(max_pair);
-    if (k == static_cast<int>(f->size_) - 1) {
-        buffer_.finish_use(fpos);
-        buffer_.finish_use(cur_pos);
+
+    diskpos_t fpos = cur_.fa_;
+    KEYPAIR_TYPE max_pair = cur_.back();
+
+    PAGE_TYPE f;
+    read_page_copy(fpos, f);
+
+    int k = f.lower_bound(max_pair);
+    if (k == static_cast<int>(f.size_) - 1) {
         return false;
     }
-    diskpos_t bpos = f->ch_[k + 1];
-    auto bro = buffer_.get_page_mutable(bpos);
-    if (bro->size_ <= PAGE_SLOT_COUNT / 2) {
-        buffer_.finish_use(bpos);
-        buffer_.finish_use(fpos);
-        buffer_.finish_use(cur_pos);
+
+    diskpos_t bpos = f.ch_[k + 1];
+    PAGE_TYPE bro;
+    read_page_copy(bpos, bro);
+
+    if (bro.size_ <= PAGE_SLOT_COUNT / 2) {
         return false;
     }
-    cur_mut->data_[cur_mut->size_] = bro->data_[0];
-    cur_mut->ch_[cur_mut->size_] = bro->ch_[0];
-    cur_mut->size_++;
-    for (int i = 0; i < static_cast<int>(bro->size_) - 1; i++) {
-        bro->data_[i] = bro->data_[i + 1];
-        bro->ch_[i] = bro->ch_[i + 1];
+
+    cur_.data_[cur_.size_] = bro.data_[0];
+    cur_.ch_[cur_.size_] = bro.ch_[0];
+    cur_.size_++;
+
+    for (int i = 0; i < static_cast<int>(bro.size_) - 1; i++) {
+        bro.data_[i] = bro.data_[i + 1];
+        bro.ch_[i] = bro.ch_[i + 1];
     }
-    bro->size_--;
-    if (cur_mut->type_ == PageType::Internal) {
-        auto son = buffer_.get_page_mutable(cur_mut->ch_[cur_mut->size_ - 1]);
-        son->fa_ = cur_pos;
-        buffer_.finish_use(cur_mut->ch_[cur_mut->size_ - 1]);
+
+    bro.size_--;
+
+    if (cur_.type_ == PageType::Internal) {
+        PAGE_TYPE son;
+        read_page_copy(cur_.ch_[cur_.size_ - 1], son);
+        son.fa_ = pos_;
+        write_page_copy(cur_.ch_[cur_.size_ - 1], son);
     }
-    f->data_[k] = cur_mut->back();
-    buffer_.finish_use(bpos);
-    buffer_.finish_use(fpos);
-    buffer_.finish_use(cur_pos);
+
+    f.data_[k] = cur_.back();
+
+    write_page_copy(pos_, cur_);
+    write_page_copy(bpos, bro);
+    write_page_copy(fpos, f);
+
     return true;
 }
 
 BPT_TEMPLATE_ARGS
 void BPT_TYPE::merge() {
-    auto cur_mut = buffer_.get_page_mutable(pos_);
-    diskpos_t cur_pos = pos_;
-    if (cur_mut->fa_ == -1) {
-        buffer_.finish_use(cur_pos);
+    if (cur_.fa_ == -1) {
         return;
     }
-    KEYPAIR_TYPE max_pair = cur_mut->back();
-    diskpos_t fpos = cur_mut->fa_;
-    auto f = buffer_.get_page_mutable(fpos);
-    int k = f->lower_bound(max_pair);
+
+    KEYPAIR_TYPE max_pair = cur_.back();
+    diskpos_t fpos = cur_.fa_;
+
+    PAGE_TYPE f;
+    read_page_copy(fpos, f);
+
+    int k = f.lower_bound(max_pair);
+
     if (k) {
-        diskpos_t bpos = f->ch_[k - 1];
-        auto bro = buffer_.get_page_mutable(bpos);
-        if (cur_mut->type_ == PageType::Internal) {
-            for (int i = 0; i < static_cast<int>(cur_mut->size_); i++) {
-                auto son = buffer_.get_page_mutable(cur_mut->ch_[i]);
-                son->fa_ = bpos;
-                buffer_.finish_use(cur_mut->ch_[i]);
+        diskpos_t bpos = f.ch_[k - 1];
+        PAGE_TYPE bro;
+        read_page_copy(bpos, bro);
+
+        if (cur_.type_ == PageType::Internal) {
+            for (int i = 0; i < static_cast<int>(cur_.size_); i++) {
+                PAGE_TYPE son;
+                read_page_copy(cur_.ch_[i], son);
+                son.fa_ = bpos;
+                write_page_copy(cur_.ch_[i], son);
             }
         }
-        for (int i = 0; i < static_cast<int>(cur_mut->size_); i++) {
-            bro->data_[bro->size_ + i] = cur_mut->data_[i];
-            bro->ch_[bro->size_ + i] = cur_mut->ch_[i];
+
+        for (int i = 0; i < static_cast<int>(cur_.size_); i++) {
+            bro.data_[bro.size_ + i] = cur_.data_[i];
+            bro.ch_[bro.size_ + i] = cur_.ch_[i];
         }
-        bro->size_ += cur_mut->size_;
-        cur_mut->size_ = 0;
-        bro->right_ = cur_mut->right_;
-        if (cur_mut->right_ != -1) {
-            auto rp = buffer_.get_page_mutable(cur_mut->right_);
-            rp->left_ = bpos;
-            buffer_.finish_use(cur_mut->right_);
+
+        bro.size_ += cur_.size_;
+        cur_.size_ = 0;
+        bro.right_ = cur_.right_;
+
+        if (cur_.right_ != -1) {
+            PAGE_TYPE rp;
+            read_page_copy(cur_.right_, rp);
+            rp.left_ = bpos;
+            write_page_copy(cur_.right_, rp);
         }
-        for (int i = k; i < static_cast<int>(f->size_) - 1; i++) {
-            f->data_[i] = f->data_[i + 1];
-            f->ch_[i] = f->ch_[i + 1];
+
+        for (int i = k; i < static_cast<int>(f.size_) - 1; i++) {
+            f.data_[i] = f.data_[i + 1];
+            f.ch_[i] = f.ch_[i + 1];
         }
-        f->size_--;
-        f->data_[k - 1] = bro->back();
-        bool need_balance = (f->size_ < PAGE_SLOT_COUNT / 2);
-        buffer_.finish_use(bpos);
-        buffer_.finish_use(fpos);
-        buffer_.finish_use(cur_pos);
+
+        f.size_--;
+        f.data_[k - 1] = bro.back();
+
+        write_page_copy(bpos, bro);
+        write_page_copy(pos_, cur_);
+        write_page_copy(fpos, f);
+
+        bool need_balance = (f.size_ < PAGE_SLOT_COUNT / 2);
         if (need_balance) {
             pos_ = fpos;
+            cur_ = f;
             balance();
         }
     }
-    else if (k != static_cast<int>(f->size_) - 1) {
-        diskpos_t bpos = f->ch_[k + 1];
-        auto bro = buffer_.get_page_mutable(bpos);
-        if (cur_mut->type_ == PageType::Internal) {
-            for (int i = 0; i < static_cast<int>(bro->size_); i++) {
-                auto son = buffer_.get_page_mutable(bro->ch_[i]);
-                son->fa_ = cur_pos;
-                buffer_.finish_use(bro->ch_[i]);
+    else if (k != static_cast<int>(f.size_) - 1) {
+        diskpos_t bpos = f.ch_[k + 1];
+        PAGE_TYPE bro;
+        read_page_copy(bpos, bro);
+
+        if (cur_.type_ == PageType::Internal) {
+            for (int i = 0; i < static_cast<int>(bro.size_); i++) {
+                PAGE_TYPE son;
+                read_page_copy(bro.ch_[i], son);
+                son.fa_ = pos_;
+                write_page_copy(bro.ch_[i], son);
             }
         }
-        for (int i = 0; i < static_cast<int>(bro->size_); i++) {
-            cur_mut->data_[cur_mut->size_ + i] = bro->data_[i];
-            cur_mut->ch_[cur_mut->size_ + i] = bro->ch_[i];
+
+        for (int i = 0; i < static_cast<int>(bro.size_); i++) {
+            cur_.data_[cur_.size_ + i] = bro.data_[i];
+            cur_.ch_[cur_.size_ + i] = bro.ch_[i];
         }
-        cur_mut->size_ += bro->size_;
-        bro->size_ = 0;
-        cur_mut->right_ = bro->right_;
-        if (bro->right_ != -1) {
-            auto rp = buffer_.get_page_mutable(bro->right_);
-            rp->left_ = cur_pos;
-            buffer_.finish_use(bro->right_);
+
+        cur_.size_ += bro.size_;
+        bro.size_ = 0;
+        cur_.right_ = bro.right_;
+
+        if (bro.right_ != -1) {
+            PAGE_TYPE rp;
+            read_page_copy(bro.right_, rp);
+            rp.left_ = pos_;
+            write_page_copy(bro.right_, rp);
         }
-        for (int i = k + 1; i < static_cast<int>(f->size_) - 1; i++) {
-            f->data_[i] = f->data_[i + 1];
-            f->ch_[i] = f->ch_[i + 1];
+
+        for (int i = k + 1; i < static_cast<int>(f.size_) - 1; i++) {
+            f.data_[i] = f.data_[i + 1];
+            f.ch_[i] = f.ch_[i + 1];
         }
-        f->size_--;
-        f->data_[k] = cur_mut->back();
-        bool need_balance = (f->size_ < PAGE_SLOT_COUNT / 2);
-        buffer_.finish_use(bpos);
-        buffer_.finish_use(fpos);
-        buffer_.finish_use(cur_pos);
+
+        f.size_--;
+        f.data_[k] = cur_.back();
+
+        write_page_copy(pos_, cur_);
+        write_page_copy(bpos, bro);
+        write_page_copy(fpos, f);
+
+        bool need_balance = (f.size_ < PAGE_SLOT_COUNT / 2);
         if (need_balance) {
             pos_ = fpos;
+            cur_ = f;
             balance();
         }
-    }
-    else {
-        buffer_.finish_use(fpos);
-        buffer_.finish_use(cur_pos);
     }
 }
 
 BPT_TEMPLATE_ARGS
 void BPT_TYPE::balance() {
-    auto cur_mut = buffer_.get_page_mutable(pos_);
-    diskpos_t cur_pos = pos_;
-    if (cur_mut->fa_ == -1) {
-        if (cur_mut->size_ == 0) {
+    if (cur_.fa_ == -1) {
+        if (cur_.size_ == 0) {
             root_ = 0;
         }
-        if (cur_mut->type_ == PageType::Internal && cur_mut->size_ == 1) {
-            diskpos_t child = cur_mut->ch_[0];
-            auto son = buffer_.get_page_mutable(child);
-            son->fa_ = -1;
-            buffer_.finish_use(child);
+
+        if (cur_.type_ == PageType::Internal && cur_.size_ == 1) {
+            diskpos_t child = cur_.ch_[0];
+            PAGE_TYPE son;
+            read_page_copy(child, son);
+            son.fa_ = -1;
+            write_page_copy(child, son);
             root_ = child;
         }
-        buffer_.finish_use(cur_pos);
+
         return;
     }
-    buffer_.finish_use(cur_pos);
+
     if (borrowl()) {
         return;
     }
