@@ -21,11 +21,12 @@ private:
         diskpos_t pos_;
         std::shared_ptr<PAGE_TYPE> page_;
         bool dirty_;
+        size_t pin_count_;
         typename std::list<diskpos_t>::iterator lru_it_;
     };
     DiskManager<PAGE_TYPE> disk_;
     std::unordered_map<diskpos_t, CacheEntry> cache_;
-    std::unordered_set<diskpos_t> cache_in_use_;
+    // std::unordered_set<diskpos_t> cache_in_use_;
     std::list<diskpos_t> lru_list_;
     size_t cache_capacity_;
 
@@ -79,16 +80,17 @@ void BUFFER_MANAGER_TYPE::evict() {
     }
     for (auto rit = lru_list_.rbegin(); rit != lru_list_.rend(); rit++) {
         diskpos_t cand = *rit;
-        if (cache_in_use_.find(cand) == cache_in_use_.end()) {
-            auto it = cache_.find(cand);
-            if (it != cache_.end()) {
-                if (it->second.dirty_) {
-                    disk_.update(*(it->second.page_), cand);
-                }
-                lru_list_.erase(std::next(rit).base());
-                cache_.erase(it);
-                return;
+        auto it = cache_.find(cand);
+        if (it != cache_.end()) {
+            if (it->second.pin_count_ > 0) {
+                continue;
             }
+            if (it->second.dirty_) {
+                disk_.update(*(it->second.page_), cand);
+            }
+            lru_list_.erase(std::next(rit).base());
+            cache_.erase(it);
+            return;
         }
     }
 }
@@ -110,6 +112,7 @@ void BUFFER_MANAGER_TYPE::load(diskpos_t pos) {
     CacheEntry entry;
     entry.pos_ = pos;
     entry.page_ = page_ptr;
+    entry.pin_count_ = 0;
     entry.dirty_ = false;
     lru_list_.push_front(pos);
     entry.lru_it_ = lru_list_.begin();
@@ -136,7 +139,7 @@ std::shared_ptr<PAGE_TYPE> BUFFER_MANAGER_TYPE::get_page_mutable(diskpos_t pos) 
     if (it != cache_.end()) {
         promote(pos);
         mark_dirty(pos);
-        cache_in_use_.insert(pos);
+        cache_[pos].pin_count_++;
         return it->second.page_;
     }
     if (cache_.size() >= cache_capacity_) {
@@ -144,7 +147,7 @@ std::shared_ptr<PAGE_TYPE> BUFFER_MANAGER_TYPE::get_page_mutable(diskpos_t pos) 
     }
     load(pos);
     mark_dirty(pos);
-    cache_in_use_.insert(pos);
+    cache_[pos].pin_count_++;
     return cache_[pos].page_;
 }
 
@@ -166,6 +169,7 @@ diskpos_t BUFFER_MANAGER_TYPE::insert_page(Page<KeyType, ValueType> &page) {
     CacheEntry entry;
     entry.pos_ = pos;
     entry.page_ = page_ptr;
+    entry.pin_count_ = 0;
     entry.dirty_ = false;
     lru_list_.push_front(pos);
     entry.lru_it_ = lru_list_.begin();
@@ -183,7 +187,6 @@ void BUFFER_MANAGER_TYPE::flush() {
     }
     cache_.clear();
     lru_list_.clear();
-    cache_in_use_.clear();
 }
 
 BUFFER_MANAGER_TEMPLATE_ARGS
@@ -200,7 +203,10 @@ void BUFFER_MANAGER_TYPE::set_root_pos(diskpos_t pos) {
 
 BUFFER_MANAGER_TEMPLATE_ARGS
 void BUFFER_MANAGER_TYPE::finish_use(diskpos_t pos) {
-    cache_in_use_.erase(pos);
+    if (cache_.find(pos) == cache_.end()) {
+        return;
+    }
+    cache_[pos].pin_count_--;
 }
 
 } // namespace sjtu

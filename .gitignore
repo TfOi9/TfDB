@@ -12,3 +12,4 @@ test/*
 tools/*
 temp/*
 .DS_Store
+.cache
