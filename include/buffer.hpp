@@ -56,11 +56,14 @@ private:
     void release_write(diskpos_t pos);
 
 public:
-    BufferManager(size_t cache_capacity = CACHE_CAPACITY, const std::string& file_name = "default.dat");
+    BufferManager() = default;
+    BufferManager(size_t cache_capacity, const std::string& file_name);
     BufferManager(const BufferManager& oth) = delete;
     ~BufferManager();
 
     BufferManager& operator=(const BufferManager& oth) = delete;
+
+    void initialise(size_t cache_capacity = CACHE_CAPACITY, const std::string& file_name = "default.dat");
 
     ReadGuard<KeyType, ValueType> read_page(diskpos_t pos);
     WriteGuard<KeyType, ValueType> write_page(diskpos_t pos);
@@ -81,6 +84,12 @@ BUFFER_MANAGER_TYPE::BufferManager(size_t cache_capacity, const std::string& fil
 BUFFER_MANAGER_TEMPLATE_ARGS
 BUFFER_MANAGER_TYPE::~BufferManager() {
     flush();
+}
+
+BUFFER_MANAGER_TEMPLATE_ARGS
+void BUFFER_MANAGER_TYPE::initialise(size_t cache_capacity, const std::string& file_name) {
+    cache_capacity_ = cache_capacity;
+    disk_.initialise(file_name);
 }
 
 BUFFER_MANAGER_TEMPLATE_ARGS

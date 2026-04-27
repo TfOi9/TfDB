@@ -45,11 +45,14 @@ public:
         size_t size_;
     };
 
-    explicit LogManager(const std::string& file_name);
+    LogManager() = default;
+    LogManager(const std::string& file_name);
     ~LogManager();
 
     LogManager(const LogManager& oth) = delete;
     LogManager& operator=(const LogManager& oth) = delete;
+
+    void initialise(const std::string& file_name);
 
     void append_page_update(diskpos_t pos, const PAGE_TYPE& page);
     void append_root_update(diskpos_t root_pos);
@@ -80,6 +83,14 @@ LOGMANAGER_TYPE::~LogManager() {
     flush();
     if (fd_ != -1) {
         close(fd_);
+    }
+}
+
+LOGMANAGER_TEMPLATE_ARGS
+void LOGMANAGER_TYPE::initialise(const std::string &file_name) {
+    fd_ = open(file_name.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd_ == -1) {
+        throw std::runtime_error("Failed to open WAL file");
     }
 }
 
@@ -120,7 +131,7 @@ void LOGMANAGER_TYPE::flush() {
         if (written != buffer_.size()) {
             throw std::runtime_error("WAL file write error");
         }
-        if (fdatasync(fd_) == -1) {
+        if (fsync(fd_) == -1) {
             throw std::runtime_error("WAL file sync error");
         }
         buffer_.clear();

@@ -6,10 +6,11 @@
 #include <optional>
 #include <string>
 #include <vector>
-
 #include "buffer.hpp"
 #include "config.hpp"
+#include "guard.hpp"
 #include "page.hpp"
+#include "log.hpp"
 
 namespace sjtu {
 #define BPT_TYPE BPlusTree<KeyType, ValueType>
@@ -24,6 +25,7 @@ private:
     };
 
     BUFFER_MANAGER_TYPE buffer_;
+    LOGMANAGER_TYPE wal_log_;
     diskpos_t root_ = 0;
     mutable std::mutex root_latch_;
 
@@ -57,6 +59,7 @@ private:
     void set_root(diskpos_t root) {
         std::lock_guard<std::mutex> lock(root_latch_);
         root_ = root;
+        wal_log_.append_root_update(root);
     }
 
     bool latch_root_read(Context &ctx);
@@ -67,6 +70,8 @@ private:
 
     void split_upward(Context &ctx);
     void rebalance_after_erase(Context &ctx);
+
+    void log_page(WRITE_GUARD_TYPE& guard);
 
 public:
     BPlusTree(const std::string file_name = "bpt.dat");
@@ -79,7 +84,13 @@ public:
 };
 
 BPT_TEMPLATE_ARGS
-BPT_TYPE::BPlusTree(const std::string file_name) : buffer_(CACHE_CAPACITY, file_name) {
+BPT_TYPE::BPlusTree(const std::string file_name) {
+    if (LOGMANAGER_TYPE::needs_recovery(file_name)) {
+        std::cerr << "now recovering...\n";
+        LOGMANAGER_TYPE::recover(file_name);
+    }
+    buffer_.initialise(CACHE_CAPACITY, file_name);
+    wal_log_.initialise(file_name);
     root_ = buffer_.get_root_pos();
 }
 
@@ -176,6 +187,7 @@ diskpos_t BPT_TYPE::find_leaf_write_crabbing(const KEYPAIR_TYPE &kp, Context &ct
             const bool child_safe = child_page.size_ < PAGE_SLOT_COUNT - 1;
             if (child_safe) {
                 while (ctx.write_set_.size() > 1) {
+                    log_page(ctx.write_set_.front());
                     ctx.write_set_.pop_front();
                 }
             }
@@ -223,12 +235,14 @@ void BPT_TYPE::split_upward(Context &ctx) {
             for (int i = 0; i < static_cast<int>(newp.size_); i++) {
                 auto ch_guard = buffer_.write_page(newp.ch_[i]);
                 ch_guard.get_page().fa_ = newp_pos;
+                wal_log_.append_page_update(ch_guard.get_pos(), ch_guard.get_page());
             }
         }
 
         if (cur.right_ != -1) {
             auto rp_guard = buffer_.write_page(cur.right_);
             rp_guard.get_page().left_ = newp_pos;
+            wal_log_.append_page_update(rp_guard.get_pos(), rp_guard.get_page());
         }
         cur.right_ = newp_pos;
 
@@ -256,6 +270,7 @@ void BPT_TYPE::split_upward(Context &ctx) {
                 return;
             }
 
+            log_page(ctx.write_set_.back());
             ctx.write_set_.pop_back();
             continue;
         }
@@ -273,6 +288,7 @@ void BPT_TYPE::split_upward(Context &ctx) {
         {
             auto newp_guard = buffer_.write_page(newp_pos);
             newp_guard.get_page().fa_ = new_root_pos;
+            wal_log_.append_page_update(newp_guard.get_pos(), newp_guard.get_page());
         }
         set_root(new_root_pos);
         return;
@@ -297,6 +313,7 @@ void BPT_TYPE::rebalance_after_erase(Context &ctx) {
                 diskpos_t child = cur.ch_[0];
                 auto son_guard = buffer_.write_page(child);
                 son_guard.get_page().fa_ = -1;
+                wal_log_.append_page_update(son_guard.get_pos(), son_guard.get_page());
                 set_root(child);
                 return;
             }
@@ -348,7 +365,9 @@ void BPT_TYPE::rebalance_after_erase(Context &ctx) {
                     auto son_guard = buffer_.write_page(cur.ch_[0]);
                     son_guard.get_page().fa_ = cur_pos;
                     parent.data_[child_idx - 1] = left.back();
+                    wal_log_.append_page_update(son_guard.get_pos(), son_guard.get_page());
                 }
+                wal_log_.append_page_update(left_guard.get_pos(), left_guard.get_page());
                 return;
             }
         }
@@ -371,8 +390,10 @@ void BPT_TYPE::rebalance_after_erase(Context &ctx) {
                 if (cur.type_ == PageType::Internal) {
                     auto son_guard = buffer_.write_page(cur.ch_[cur.size_ - 1]);
                     son_guard.get_page().fa_ = cur_pos;
+                    wal_log_.append_page_update(son_guard.get_pos(), son_guard.get_page());
                 }
                 parent.data_[child_idx] = cur.back();
+                wal_log_.append_page_update(right_guard.get_pos(), right_guard.get_page());
                 return;
             }
         }
@@ -386,6 +407,7 @@ void BPT_TYPE::rebalance_after_erase(Context &ctx) {
                 for (int i = 0; i < static_cast<int>(cur.size_); i++) {
                     auto son_guard = buffer_.write_page(cur.ch_[i]);
                     son_guard.get_page().fa_ = left_pos;
+                    wal_log_.append_page_update(son_guard.get_pos(), son_guard.get_page());
                 }
             }
 
@@ -400,6 +422,7 @@ void BPT_TYPE::rebalance_after_erase(Context &ctx) {
             if (cur.right_ != -1) {
                 auto rp_guard = buffer_.write_page(cur.right_);
                 rp_guard.get_page().left_ = left_pos;
+                wal_log_.append_page_update(rp_guard.get_pos(), rp_guard.get_page());
             }
 
             for (int i = child_idx; i < static_cast<int>(parent.size_) - 1; i++) {
@@ -411,6 +434,8 @@ void BPT_TYPE::rebalance_after_erase(Context &ctx) {
                 parent.data_[child_idx - 1] = left.back();
             }
 
+            wal_log_.append_page_update(left_guard.get_pos(), left_guard.get_page());
+            log_page(ctx.write_set_.back());
             ctx.write_set_.pop_back();
             continue;
         }
@@ -424,6 +449,7 @@ void BPT_TYPE::rebalance_after_erase(Context &ctx) {
                 for (int i = 0; i < static_cast<int>(right.size_); i++) {
                     auto son_guard = buffer_.write_page(right.ch_[i]);
                     son_guard.get_page().fa_ = cur_pos;
+                    wal_log_.append_page_update(son_guard.get_pos(), son_guard.get_page());
                 }
             }
 
@@ -438,6 +464,7 @@ void BPT_TYPE::rebalance_after_erase(Context &ctx) {
             if (right.right_ != -1) {
                 auto rp_guard = buffer_.write_page(right.right_);
                 rp_guard.get_page().left_ = cur_pos;
+                wal_log_.append_page_update(rp_guard.get_pos(), rp_guard.get_page());
             }
 
             for (int i = child_idx + 1; i < static_cast<int>(parent.size_) - 1; i++) {
@@ -449,12 +476,19 @@ void BPT_TYPE::rebalance_after_erase(Context &ctx) {
                 parent.data_[child_idx] = cur.back();
             }
 
+            wal_log_.append_page_update(right_guard.get_pos(), right_guard.get_page());
+            log_page(ctx.write_set_.back());
             ctx.write_set_.pop_back();
             continue;
         }
 
         return;
     }
+}
+
+BPT_TEMPLATE_ARGS
+void BPT_TYPE::log_page(WRITE_GUARD_TYPE& guard) {
+    wal_log_.append_page_update(guard.get_pos(), guard.get_page());
 }
 
 BPT_TEMPLATE_ARGS
@@ -535,7 +569,10 @@ void BPT_TYPE::insert(const KeyType &key, const ValueType &val) {
                 newr.type_ = PageType::Leaf;
                 newr.size_ = 1;
                 newr.data_[0] = kp;
-                root_ = buffer_.insert_page(newr);
+                diskpos_t new_root = buffer_.insert_page(newr);
+                wal_log_.append_page_update(new_root, newr);
+                set_root(new_root);
+                wal_log_.flush();
                 return;
             }
         }
@@ -555,10 +592,21 @@ void BPT_TYPE::insert(const KeyType &key, const ValueType &val) {
         if (leaf.size_ == 0) {
             leaf.data_[0] = kp;
             leaf.size_ = 1;
+
+            for (auto& guard : ctx.write_set_) {
+                log_page(guard);
+            }
+            wal_log_.flush();
+
             return;
         }
 
         if (k >= 0 && k < static_cast<int>(leaf.size_) && leaf.data_[k] == kp) {
+            for (auto& guard : ctx.write_set_) {
+                log_page(guard);
+            }
+            wal_log_.flush();
+            
             return;
         }
 
@@ -576,6 +624,12 @@ void BPT_TYPE::insert(const KeyType &key, const ValueType &val) {
         if (leaf.size_ >= PAGE_SLOT_COUNT) {
             split_upward(ctx);
         }
+
+        for (auto& guard : ctx.write_set_) {
+            log_page(guard);
+        }
+        wal_log_.flush();
+
         return;
     }
 }
@@ -586,16 +640,31 @@ void BPT_TYPE::erase(const KeyType &key, const ValueType &val) {
 
     Context ctx;
     if (!latch_root_write(ctx)) {
+        for (auto& guard : ctx.write_set_) {
+            log_page(guard);
+        }
+        wal_log_.flush();
+
         return;
     }
 
     if (find_leaf_write_crabbing(kp, ctx, false) == 0 || ctx.write_set_.empty()) {
+        for (auto& guard : ctx.write_set_) {
+            log_page(guard);
+        }
+        wal_log_.flush();
+        
         return;
     }
 
     auto &leaf = ctx.write_set_.back().get_page();
     int k = clamp_index(leaf.lower_bound(kp), leaf.size_);
     if (k < 0 || k >= static_cast<int>(leaf.size_) || leaf.data_[k] != kp) {
+        for (auto& guard : ctx.write_set_) {
+            log_page(guard);
+        }
+        wal_log_.flush();
+        
         return;
     }
 
@@ -622,12 +691,23 @@ void BPT_TYPE::erase(const KeyType &key, const ValueType &val) {
         if (leaf.size_ == 0) {
             set_root(0);
         }
+
+        for (auto& guard : ctx.write_set_) {
+            log_page(guard);
+        }
+        wal_log_.flush();
+        
         return;
     }
 
     if (leaf.size_ < PAGE_SLOT_COUNT / 2) {
         rebalance_after_erase(ctx);
     }
+
+    for (auto& guard : ctx.write_set_) {
+        log_page(guard);
+    }
+    wal_log_.flush();
 }
 
 } // namespace sjtu
