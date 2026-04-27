@@ -571,7 +571,8 @@ void BPT_TYPE::insert(const KeyType &key, const ValueType &val) {
                 newr.data_[0] = kp;
                 diskpos_t new_root = buffer_.insert_page(newr);
                 wal_log_.append_page_update(new_root, newr);
-                set_root(new_root);
+                root_ = new_root;
+                wal_log_.append_root_update(new_root);
                 wal_log_.flush();
                 return;
             }

@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
 #include <atomic>
 #include <stdexcept>
@@ -22,10 +23,10 @@ namespace sjtu {
 LOGMANAGER_TEMPLATE_ARGS
 class LogManager {
 private:
-    int fd_;
+    int fd_ = -1;
     std::string file_name_;
     std::vector<uint8_t> buffer_;
-    std::atomic<uint64_t> lsn_counter_;
+    std::atomic<uint64_t> lsn_counter_{0};
     std::mutex log_mtx_;
 
     void append_bytes(const void* data, size_t size);
@@ -71,11 +72,8 @@ void LOGMANAGER_TYPE::append_bytes(const void* data, size_t size) {
 }
 
 LOGMANAGER_TEMPLATE_ARGS
-LOGMANAGER_TYPE::LogManager(const std::string& file_name): file_name_(file_name), lsn_counter_(0) {
-    fd_ = open(file_name.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd_ == -1) {
-        throw std::runtime_error("Failed to open WAL file");
-    }
+LOGMANAGER_TYPE::LogManager(const std::string& file_name) {
+    initialise(file_name);
 }
 
 LOGMANAGER_TEMPLATE_ARGS
@@ -88,7 +86,17 @@ LOGMANAGER_TYPE::~LogManager() {
 
 LOGMANAGER_TEMPLATE_ARGS
 void LOGMANAGER_TYPE::initialise(const std::string &file_name) {
-    fd_ = open(file_name.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    std::lock_guard<std::mutex> lock(log_mtx_);
+    if (fd_ != -1) {
+        close(fd_);
+        fd_ = -1;
+    }
+
+    file_name_ = file_name + ".wal";
+    buffer_.clear();
+    lsn_counter_.store(0, std::memory_order_relaxed);
+
+    fd_ = open(file_name_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd_ == -1) {
         throw std::runtime_error("Failed to open WAL file");
     }
@@ -127,9 +135,17 @@ LOGMANAGER_TEMPLATE_ARGS
 void LOGMANAGER_TYPE::flush() {
     std::lock_guard<std::mutex> lock(log_mtx_);
     if (!buffer_.empty()) {
-        ssize_t written = write(fd_, reinterpret_cast<const char*>(buffer_.data()), buffer_.size());
-        if (written != buffer_.size()) {
-            throw std::runtime_error("WAL file write error");
+        if (fd_ == -1) {
+            throw std::runtime_error("WAL file is not initialized");
+        }
+
+        size_t offset = 0;
+        while (offset < buffer_.size()) {
+            ssize_t written = write(fd_, reinterpret_cast<const char*>(buffer_.data() + offset), buffer_.size() - offset);
+            if (written <= 0) {
+                throw std::runtime_error("WAL file write error");
+            }
+            offset += static_cast<size_t>(written);
         }
         if (fsync(fd_) == -1) {
             throw std::runtime_error("WAL file sync error");
@@ -161,20 +177,31 @@ void LOGMANAGER_TYPE::recover(const std::string& file_name) {
     while (wal.good()) {
         LogEntry entry;
         wal.read(reinterpret_cast<char*>(&entry), sizeof(LogEntry));
-        if (wal.eof()) break;
-        if (wal.fail()) {
-            throw std::runtime_error("WAL recovery: failed to read log entry header");
+        std::streamsize header_bytes = wal.gcount();
+        if (header_bytes == 0) {
+            break;
+        }
+        if (header_bytes != static_cast<std::streamsize>(sizeof(LogEntry))) {
+            // Ignore torn tail caused by crash during append.
+            break;
         }
 
         if (entry.type_ == LogType::PageUpdate) {
+            if (entry.size_ != sizeof(PAGE_TYPE)) {
+                throw std::runtime_error("WAL recovery: invalid page payload size");
+            }
             PAGE_TYPE page;
             wal.read(reinterpret_cast<char*>(&page), sizeof(PAGE_TYPE));
-            if (wal.fail()) {
-                throw std::runtime_error("WAL recovery: failed to read page image");
+            if (wal.gcount() != static_cast<std::streamsize>(sizeof(PAGE_TYPE))) {
+                // Ignore torn tail caused by crash during append.
+                break;
             }
             disk.update(page, entry.pos_);
         }
         else if (entry.type_ == LogType::RootUpdate) {
+            if (entry.size_ != 0) {
+                throw std::runtime_error("WAL recovery: invalid root payload size");
+            }
             diskpos_t root = entry.pos_;
             disk.write_info(root, 2);
         }
