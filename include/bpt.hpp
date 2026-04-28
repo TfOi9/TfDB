@@ -86,7 +86,6 @@ public:
 BPT_TEMPLATE_ARGS
 BPT_TYPE::BPlusTree(const std::string file_name) {
     if (LOGMANAGER_TYPE::needs_recovery(file_name)) {
-        std::cerr << "now recovering...\n";
         LOGMANAGER_TYPE::recover(file_name);
     }
     buffer_.initialise(CACHE_CAPACITY, file_name);
@@ -230,6 +229,7 @@ void BPT_TYPE::split_upward(Context &ctx) {
         const KEYPAIR_TYPE max_pair = newp.back();
 
         diskpos_t newp_pos = buffer_.insert_page(newp);
+        wal_log_.append_page_update(newp_pos, newp);
 
         if (!is_leaf) {
             for (int i = 0; i < static_cast<int>(newp.size_); i++) {
@@ -284,6 +284,7 @@ void BPT_TYPE::split_upward(Context &ctx) {
         newr.ch_[1] = newp_pos;
 
         diskpos_t new_root_pos = buffer_.insert_page(newr);
+        wal_log_.append_page_update(new_root_pos, newr);
         cur.fa_ = new_root_pos;
         {
             auto newp_guard = buffer_.write_page(newp_pos);

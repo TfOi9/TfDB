@@ -15,7 +15,7 @@ constexpr size_t CACHE_CAPACITY = 1600;
 
 typedef int64_t hash_t;
 
-constexpr bool USE_WAL = false;
+constexpr bool USE_WAL = true;
 
 constexpr hash_t HASH_MOD1 = 998244353;
 constexpr hash_t HASH_MOD2 = 1000000007;
