@@ -67,17 +67,20 @@ public:
 
 LOGMANAGER_TEMPLATE_ARGS
 void LOGMANAGER_TYPE::append_bytes(const void* data, size_t size) {
+    if (!USE_WAL) return;
     const uint8_t* bytes = static_cast<const uint8_t*>(data);
     buffer_.insert(buffer_.end(), bytes, bytes + size);
 }
 
 LOGMANAGER_TEMPLATE_ARGS
 LOGMANAGER_TYPE::LogManager(const std::string& file_name) {
+    if (!USE_WAL) return;
     initialise(file_name);
 }
 
 LOGMANAGER_TEMPLATE_ARGS
 LOGMANAGER_TYPE::~LogManager() {
+    if (!USE_WAL) return;
     flush();
     if (fd_ != -1) {
         close(fd_);
@@ -86,6 +89,7 @@ LOGMANAGER_TYPE::~LogManager() {
 
 LOGMANAGER_TEMPLATE_ARGS
 void LOGMANAGER_TYPE::initialise(const std::string &file_name) {
+    if (!USE_WAL) return;
     std::lock_guard<std::mutex> lock(log_mtx_);
     if (fd_ != -1) {
         close(fd_);
@@ -104,6 +108,7 @@ void LOGMANAGER_TYPE::initialise(const std::string &file_name) {
 
 LOGMANAGER_TEMPLATE_ARGS
 void LOGMANAGER_TYPE::append_page_update(diskpos_t pos, const PAGE_TYPE& page) {
+    if (!USE_WAL) return;
     std::lock_guard<std::mutex> lock(log_mtx_);
 
     LogEntry entry {
@@ -119,6 +124,7 @@ void LOGMANAGER_TYPE::append_page_update(diskpos_t pos, const PAGE_TYPE& page) {
 
 LOGMANAGER_TEMPLATE_ARGS
 void LOGMANAGER_TYPE::append_root_update(diskpos_t root_pos) {
+    if (!USE_WAL) return;
     std::lock_guard<std::mutex> lock(log_mtx_);
 
     LogEntry entry {
@@ -133,6 +139,7 @@ void LOGMANAGER_TYPE::append_root_update(diskpos_t root_pos) {
 
 LOGMANAGER_TEMPLATE_ARGS
 void LOGMANAGER_TYPE::flush() {
+    if (!USE_WAL) return;
     std::lock_guard<std::mutex> lock(log_mtx_);
     if (!buffer_.empty()) {
         if (fd_ == -1) {
@@ -156,6 +163,7 @@ void LOGMANAGER_TYPE::flush() {
 
 LOGMANAGER_TEMPLATE_ARGS
 bool LOGMANAGER_TYPE::needs_recovery(const std::string &file_name) {
+    if (!USE_WAL) return false;
     const std::string wal_file = file_name + ".wal";
     std::ifstream wal(wal_file, std::ios::binary | std::ios::ate);
     if (!wal.is_open()) return false;
@@ -166,6 +174,7 @@ bool LOGMANAGER_TYPE::needs_recovery(const std::string &file_name) {
 
 LOGMANAGER_TEMPLATE_ARGS
 void LOGMANAGER_TYPE::recover(const std::string& file_name) {
+    if (!USE_WAL) return;
     const std::string wal_file = file_name + ".wal";
 
     std::ifstream wal(wal_file, std::ios::binary);
