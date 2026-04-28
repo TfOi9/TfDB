@@ -24,7 +24,7 @@ private:
     /*
         Current info area distribution:
 
-            [1. root of BPT] [2. size of free list] [3. free pos #1] ... [(n + 2). free pos #n]
+            [1. size of free list] [2. root of BPT] [3. free pos #1] ... [(n + 2). free pos #n]
 
     */
 
