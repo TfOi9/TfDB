@@ -186,7 +186,7 @@ diskpos_t BPT_TYPE::find_leaf_write_crabbing(const KEYPAIR_TYPE &kp, Context &ct
             const bool child_safe = child_page.size_ < PAGE_SLOT_COUNT - 1;
             if (child_safe) {
                 while (ctx.write_set_.size() > 1) {
-                    log_page(ctx.write_set_.front());
+                    // log_page(ctx.write_set_.front());
                     ctx.write_set_.pop_front();
                 }
             }

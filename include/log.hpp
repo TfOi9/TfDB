@@ -319,6 +319,7 @@ void LOGMANAGER_TYPE::recover(const std::string& file_name) {
             break;
         }
 
+        bool bad = false;
         switch (entry.type_) {
             case LogType::PageInit: {
                 if (entry.size_ != sizeof(PAGE_TYPE)) {
@@ -327,7 +328,8 @@ void LOGMANAGER_TYPE::recover(const std::string& file_name) {
                 PAGE_TYPE page;
                 wal.read(reinterpret_cast<char*>(&page), sizeof(PAGE_TYPE));
                 if (wal.gcount() != sizeof(PAGE_TYPE)) {
-                    throw std::runtime_error("WAL recovery: read error");
+                    bad = true;
+                    break;
                 }
                 disk.update(page, entry.pos_);
                 break;
@@ -349,20 +351,23 @@ void LOGMANAGER_TYPE::recover(const std::string& file_name) {
                 int slot_idx;
                 diskpos_t child_pos;
                 KEYPAIR_TYPE kp;
-                wal.read(reinterpret_cast<char*>(slot_idx), sizeof(int));
+                wal.read(reinterpret_cast<char*>(&slot_idx), sizeof(int));
                 if (wal.gcount() != sizeof(int)) {
-                    throw std::runtime_error("WAL recovery: read error");
+                    bad = true;
+                    break;
                 }
-                wal.read(reinterpret_cast<char*>(child_pos), sizeof(diskpos_t));
+                wal.read(reinterpret_cast<char*>(&child_pos), sizeof(diskpos_t));
                 if (wal.gcount() != sizeof(diskpos_t)) {
-                    throw std::runtime_error("WAL recovery: read error");
+                    bad = true;
+                    break;
                 }
-                wal.read(reinterpret_cast<char*>(kp), sizeof(KEYPAIR_TYPE));
+                wal.read(reinterpret_cast<char*>(&kp), sizeof(KEYPAIR_TYPE));
                 if (wal.gcount() != sizeof(KEYPAIR_TYPE)) {
-                    throw std::runtime_error("WAL recovery: read error");
+                    bad = true;
+                    break;
                 }
                 PAGE_TYPE page;
-                disk.read(&page, entry.pos_);
+                disk.read(page, entry.pos_);
                 for (int i = page.size_ - 1; i >= slot_idx; i--) {
                     page.data_[i + 1] = page.data_[i];
                     page.ch_[i + 1] = page.ch_[i];
@@ -370,7 +375,7 @@ void LOGMANAGER_TYPE::recover(const std::string& file_name) {
                 page.data_[slot_idx] = kp;
                 page.ch_[slot_idx] = child_pos;
                 page.size_++;
-                disk.update(&page, entry.pos_);
+                disk.update(page, entry.pos_);
                 break;
             }
 
@@ -381,16 +386,17 @@ void LOGMANAGER_TYPE::recover(const std::string& file_name) {
                 int slot_idx;
                 wal.read(reinterpret_cast<char*>(slot_idx), sizeof(int));
                 if (wal.gcount() != sizeof(int)) {
-                    throw std::runtime_error("WAL recovery: read error");
+                    bad = true;
+                    break;
                 }
                 PAGE_TYPE page;
-                disk.read(&page, entry.pos_);
+                disk.read(page, entry.pos_);
                 for (int i = slot_idx; i < page.size_ - 1; i++) {
                     page.data_[i] = page.data_[i + 1];
                     page.ch_[i] = page.ch_[i + 1];
                 }
                 page.size_--;
-                disk.update(&page, entry.pos_);
+                disk.update(page, entry.pos_);
                 break;
             }
 
@@ -400,18 +406,20 @@ void LOGMANAGER_TYPE::recover(const std::string& file_name) {
                 }
                 int slot_idx;
                 KEYPAIR_TYPE kp;
-                wal.read(reinterpret_cast<char*>(slot_idx), sizeof(int));
+                wal.read(reinterpret_cast<char*>(&slot_idx), sizeof(int));
                 if (wal.gcount() != sizeof(int)) {
-                    throw std::runtime_error("WAL recovery: read error");
+                    bad = true;
+                    break;
                 }
-                wal.read(reinterpret_cast<char*>(kp), sizeof(KEYPAIR_TYPE));
+                wal.read(reinterpret_cast<char*>(&kp), sizeof(KEYPAIR_TYPE));
                 if (wal.gcount() != sizeof(KEYPAIR_TYPE)) {
-                    throw std::runtime_error("WAL recovery: read error");
+                    bad = true;
+                    break;
                 }
                 PAGE_TYPE page;
-                disk.read(&page, entry.pos_);
+                disk.read(page, entry.pos_);
                 page.data_[slot_idx] = kp;
-                disk.update(&page, entry.pos_);
+                disk.update(page, entry.pos_);
                 break;
             }
 
@@ -420,15 +428,18 @@ void LOGMANAGER_TYPE::recover(const std::string& file_name) {
                 bool is_leaf;
                 wal.read(reinterpret_cast<char*>(slot_start), sizeof(int));
                 if (wal.gcount() != sizeof(int)) {
-                    throw std::runtime_error("WAL recovery: read error");
+                    bad = true;
+                    break;
                 }
                 wal.read(reinterpret_cast<char*>(slot_count), sizeof(int));
                 if (wal.gcount() != sizeof(int)) {
-                    throw std::runtime_error("WAL recovery: read error");
+                    bad = true;
+                    break;
                 }
                 wal.read(reinterpret_cast<char*>(is_leaf), sizeof(bool));
                 if (wal.gcount() != sizeof(bool)) {
-                    throw std::runtime_error("WAL recovery: read error");
+                    bad = true;
+                    break;
                 }
                 int expected_size = sizeof(int) * 2 + sizeof(bool) + sizeof(KEYPAIR_TYPE) * slot_count + sizeof(diskpos_t) * (is_leaf ? 0 : slot_count);
                 if (expected_size != entry.size_) {
@@ -438,26 +449,28 @@ void LOGMANAGER_TYPE::recover(const std::string& file_name) {
                 for (int i = 0; i < slot_count; i++) {
                     wal.read(reinterpret_cast<char*>(&new_page.data_[i + slot_start]), sizeof(KEYPAIR_TYPE));
                     if (wal.gcount() != sizeof(KEYPAIR_TYPE)) {
-                        throw std::runtime_error("WAL recovery: read error");
+                        bad = true;
+                    break;
                     }
                 }
                 if (!is_leaf) {
                     for (int i = 0; i < slot_count; i++) {
                         wal.read(reinterpret_cast<char*>(&new_page.ch_[i + slot_start]), sizeof(diskpos_t));
                         if (wal.gcount() != sizeof(diskpos_t)) {
-                            throw std::runtime_error("WAL recovery: read error");
+                            bad = true;
+                    break;
                         }
                     }
                 }
                 PAGE_TYPE page;
-                disk.read(&page, entry.pos_);
+                disk.read(page, entry.pos_);
                 for (int i = 0; i < slot_count; i++) {
                     page.data_[i + slot_start] = new_page.data_[i + slot_start];
                     if (!is_leaf) {
                         page.ch_[i + slot_start] = new_page.ch_[i + slot_start];
                     }
                 }
-                disk.update(&page, entry.pos_);
+                disk.update(page, entry.pos_);
                 break;
             }
 
@@ -465,17 +478,19 @@ void LOGMANAGER_TYPE::recover(const std::string& file_name) {
                 int mask, temp;
                 wal.read(reinterpret_cast<char*>(&mask), 8);
                 if (wal.gcount() != 8) {
-                    throw std::runtime_error("WAL recovery: read error");
+                    bad = true;
+                    break;
                 }
                 if (entry.size_ != 8 + 8 * __builtin_popcount(mask)) {
                     throw std::runtime_error("WAL recovery: invalid page payload size");
                 }
                 PAGE_TYPE page;
-                disk.read(&page, entry.pos_);
+                disk.read(page, entry.pos_);
                 if (mask & (1 << 4)) {
                     wal.read(reinterpret_cast<char*>(&temp), 8);
                     if (wal.gcount() != 8) {
-                        throw std::runtime_error("WAL recovery: read error");
+                        bad = true;
+                    break;
                     }
                     if (temp == 1) {
                         page.type_ = PageType::Leaf;
@@ -487,36 +502,45 @@ void LOGMANAGER_TYPE::recover(const std::string& file_name) {
                 if (mask & (1 << 3)) {
                     wal.read(reinterpret_cast<char*>(&temp), 8);
                     if (wal.gcount() != 8) {
-                        throw std::runtime_error("WAL recovery: read error");
+                        bad = true;
+                    break;
                     }
                     page.fa_ = temp;
                 }
                 if (mask & (1 << 2)) {
                     wal.read(reinterpret_cast<char*>(&temp), 8);
                     if (wal.gcount() != 8) {
-                        throw std::runtime_error("WAL recovery: read error");
+                        bad = true;
+                    break;
                     }
                     page.left_ = temp;
                 }
                 if (mask & (1 << 1)) {
                     wal.read(reinterpret_cast<char*>(&temp), 8);
                     if (wal.gcount() != 8) {
-                        throw std::runtime_error("WAL recovery: read error");
+                        bad = true;
+                    break;
                     }
                     page.right_ = temp;
                 }
                 if (mask & 1) {
                     wal.read(reinterpret_cast<char*>(&temp), 8);
                     if (wal.gcount() != 8) {
-                        throw std::runtime_error("WAL recovery: read error");
+                        bad = true;
+                    break;
                     }
                     page.size_ = temp;
                 }
+                disk.update(page, entry.pos_);
                 break;
             }
 
             default:
                 throw std::runtime_error("WAL recovery: unknown log type");
+        }
+
+        if (bad) {
+            break;
         }
     }
 
