@@ -129,6 +129,7 @@ struct Page {
     diskpos_t left_ = -1;
     diskpos_t right_ = -1;
     size_t size_ = 0;
+    uint64_t page_lsn_ = 0;
 
     Page() = default;
 

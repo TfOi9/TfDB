@@ -12,6 +12,8 @@
 #include <string>
 #include <fstream>
 #include <vector>
+#include <unordered_map>
+#include <cstring>
 #include "config.hpp"
 #include "page.hpp"
 #include "disk.hpp"
@@ -32,17 +34,27 @@ private:
     void append_bytes(const void* data, size_t size);
 
 public:
-    enum class LogType: uint8_t {
-        PageInit = 0,
-        SlotInsert,
-        SlotDelete,
-        SlotUpdate,
-        SlotRangeInit,
-        MetaUpdate,
-        RootUpdate
+    using log_type_t = uint8_t;
+
+    struct LogType {
+        static constexpr log_type_t PageUpdate    = 0;
+        static constexpr log_type_t RootUpdate    = 1;
+        static constexpr log_type_t MetaUpdate    = 2;
+        static constexpr log_type_t SlotInsert    = 3;
+        static constexpr log_type_t SlotDelete    = 4;
+        static constexpr log_type_t SlotUpdate    = 5;
+        static constexpr log_type_t SlotRangeInit = 6;
+        static constexpr log_type_t PageInit      = 7;
     };
 
-    typedef LogType log_type_t;
+    struct MetaField {
+        static constexpr uint8_t NONE  = 0;
+        static constexpr uint8_t SIZE  = 1 << 0;
+        static constexpr uint8_t LEFT  = 1 << 1;
+        static constexpr uint8_t RIGHT = 1 << 2;
+        static constexpr uint8_t FA    = 1 << 3;
+        static constexpr uint8_t TYPE  = 1 << 4;
+    };
 
     struct LogEntry {
         uint64_t lsn_;
@@ -62,17 +74,17 @@ public:
 
     void append_page_update(diskpos_t pos, const PAGE_TYPE& page);
     void append_root_update(diskpos_t root_pos);
-    void append_slot_insert(diskpos_t pos, int slot_idx, diskpos_t child_pos, const KEYPAIR_TYPE& kp);
-    void append_slot_delete(diskpos_t pos, int slot_idx);
-    void append_slot_update(diskpos_t pos, int slot_idx, const KEYPAIR_TYPE& kp);
-    void append_slot_range_init(diskpos_t pos, int slot_start, int slot_count, bool is_leaf, const PAGE_TYPE& page);
-    void append_meta_update(diskpos_t pos, uint64_t mask, const PAGE_TYPE& page);
+    void append_page_init(diskpos_t pos, const PAGE_TYPE& page);
+    void append_meta_update(diskpos_t pos, uint8_t field_mask, const PAGE_TYPE& page);
+    void append_slot_insert(diskpos_t pos, uint16_t slot_idx, diskpos_t child_pos, const KeyType& key, const ValueType& val);
+    void append_slot_delete(diskpos_t pos, uint16_t slot_idx);
+    void append_slot_update(diskpos_t pos, uint16_t slot_idx, const KeyType& key, const ValueType& val);
+    void append_slot_range_init(diskpos_t pos, uint16_t count, bool is_leaf, const PAGE_TYPE& src_page);
 
     void flush();
 
     static bool needs_recovery(const std::string& file_name);
     static void recover(const std::string& file_name);
-
 };
 
 LOGMANAGER_TEMPLATE_ARGS
@@ -108,7 +120,7 @@ void LOGMANAGER_TYPE::initialise(const std::string &file_name) {
 
     file_name_ = file_name + ".wal";
     buffer_.clear();
-    lsn_counter_.store(0, std::memory_order_relaxed);
+    lsn_counter_.store(1, std::memory_order_relaxed);
 
     fd_ = open(file_name_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd_ == -1) {
@@ -116,7 +128,6 @@ void LOGMANAGER_TYPE::initialise(const std::string &file_name) {
     }
 }
 
-/* Simply throw all the page data into WAL. Very expensive. Use only when you have to. */
 LOGMANAGER_TEMPLATE_ARGS
 void LOGMANAGER_TYPE::append_page_update(diskpos_t pos, const PAGE_TYPE& page) {
     if (!USE_WAL) return;
@@ -124,7 +135,7 @@ void LOGMANAGER_TYPE::append_page_update(diskpos_t pos, const PAGE_TYPE& page) {
 
     LogEntry entry {
         .lsn_ = lsn_counter_.fetch_add(1),
-        .type_ = LogType::PageInit,
+        .type_ = LogType::PageUpdate,
         .pos_ = pos,
         .size_ = sizeof(PAGE_TYPE)
     };
@@ -133,7 +144,6 @@ void LOGMANAGER_TYPE::append_page_update(diskpos_t pos, const PAGE_TYPE& page) {
     append_bytes(&page, sizeof(PAGE_TYPE));
 }
 
-/* Update the root position of BPT. Cheap. */
 LOGMANAGER_TEMPLATE_ARGS
 void LOGMANAGER_TYPE::append_root_update(diskpos_t root_pos) {
     if (!USE_WAL) return;
@@ -149,119 +159,157 @@ void LOGMANAGER_TYPE::append_root_update(diskpos_t root_pos) {
     append_bytes(&entry, sizeof(LogEntry));
 }
 
-/* Insert one slot into one page. Relatively cheap. */
 LOGMANAGER_TEMPLATE_ARGS
-void LOGMANAGER_TYPE::append_slot_insert(diskpos_t pos, int slot_idx, diskpos_t child_pos, const KEYPAIR_TYPE& kp) {
+void LOGMANAGER_TYPE::append_page_init(diskpos_t pos, const PAGE_TYPE& page) {
     if (!USE_WAL) return;
     std::lock_guard<std::mutex> lock(log_mtx_);
+
+    LogEntry entry {
+        .lsn_ = lsn_counter_.fetch_add(1),
+        .type_ = LogType::PageInit,
+        .pos_ = pos,
+        .size_ = sizeof(PAGE_TYPE)
+    };
+
+    append_bytes(&entry, sizeof(LogEntry));
+    append_bytes(&page, sizeof(PAGE_TYPE));
+}
+
+LOGMANAGER_TEMPLATE_ARGS
+void LOGMANAGER_TYPE::append_meta_update(diskpos_t pos, uint8_t field_mask,
+                                          const PAGE_TYPE& page) {
+    if (!USE_WAL) return;
+    if (field_mask == MetaField::NONE) return;
+    std::lock_guard<std::mutex> lock(log_mtx_);
+
+    size_t payload_size = 1;
+    if (field_mask & MetaField::SIZE)  payload_size += sizeof(size_t);
+    if (field_mask & MetaField::LEFT)  payload_size += sizeof(diskpos_t);
+    if (field_mask & MetaField::RIGHT) payload_size += sizeof(diskpos_t);
+    if (field_mask & MetaField::FA)    payload_size += sizeof(diskpos_t);
+    if (field_mask & MetaField::TYPE)  payload_size += sizeof(PageType);
+
+    LogEntry entry {
+        .lsn_ = lsn_counter_.fetch_add(1),
+        .type_ = LogType::MetaUpdate,
+        .pos_ = pos,
+        .size_ = payload_size
+    };
+
+    append_bytes(&entry, sizeof(LogEntry));
+    append_bytes(&field_mask, sizeof(field_mask));
+
+    if (field_mask & MetaField::SIZE)  append_bytes(&page.size_, sizeof(size_t));
+    if (field_mask & MetaField::LEFT)  append_bytes(&page.left_, sizeof(diskpos_t));
+    if (field_mask & MetaField::RIGHT) append_bytes(&page.right_, sizeof(diskpos_t));
+    if (field_mask & MetaField::FA)    append_bytes(&page.fa_, sizeof(diskpos_t));
+    if (field_mask & MetaField::TYPE)  append_bytes(&page.type_, sizeof(PageType));
+}
+
+LOGMANAGER_TEMPLATE_ARGS
+void LOGMANAGER_TYPE::append_slot_insert(diskpos_t pos, uint16_t slot_idx,
+                                          diskpos_t child_pos,
+                                          const KeyType& key, const ValueType& val) {
+    if (!USE_WAL) return;
+    std::lock_guard<std::mutex> lock(log_mtx_);
+
+    constexpr size_t kFixedSize = sizeof(uint16_t) + sizeof(diskpos_t);
+    const size_t payload_size = kFixedSize + sizeof(KeyType) + sizeof(ValueType);
 
     LogEntry entry {
         .lsn_ = lsn_counter_.fetch_add(1),
         .type_ = LogType::SlotInsert,
         .pos_ = pos,
-        .size_ = sizeof(int) + sizeof(diskpos_t) + sizeof(KEYPAIR_TYPE)
+        .size_ = payload_size
     };
 
-    append_bytes(&slot_idx, sizeof(int));
-    append_bytes(&child_pos, sizeof(diskpos_t));
-    append_bytes(&kp, sizeof(KEYPAIR_TYPE));
+    append_bytes(&entry, sizeof(LogEntry));
+    append_bytes(&slot_idx, sizeof(slot_idx));
+    append_bytes(&child_pos, sizeof(child_pos));
+    append_bytes(&key, sizeof(KeyType));
+    append_bytes(&val, sizeof(ValueType));
 }
 
-/* Delete one slot in one page. Cheap. */
 LOGMANAGER_TEMPLATE_ARGS
-void LOGMANAGER_TYPE::append_slot_delete(diskpos_t pos, int slot_idx) {
+void LOGMANAGER_TYPE::append_slot_delete(diskpos_t pos, uint16_t slot_idx) {
     if (!USE_WAL) return;
     std::lock_guard<std::mutex> lock(log_mtx_);
+
+    constexpr size_t payload_size = sizeof(uint16_t);
 
     LogEntry entry {
         .lsn_ = lsn_counter_.fetch_add(1),
         .type_ = LogType::SlotDelete,
         .pos_ = pos,
-        .size_ = sizeof(int)
+        .size_ = payload_size
     };
 
-    append_bytes(&slot_idx, sizeof(int));
+    append_bytes(&entry, sizeof(LogEntry));
+    append_bytes(&slot_idx, sizeof(slot_idx));
 }
 
-/* Update one slot in one page. Relatively Cheap. */
 LOGMANAGER_TEMPLATE_ARGS
-void LOGMANAGER_TYPE::append_slot_update(diskpos_t pos, int slot_idx, const KEYPAIR_TYPE& kp) {
+void LOGMANAGER_TYPE::append_slot_update(diskpos_t pos, uint16_t slot_idx,
+                                          const KeyType& key, const ValueType& val) {
     if (!USE_WAL) return;
     std::lock_guard<std::mutex> lock(log_mtx_);
+
+    const size_t payload_size = sizeof(uint16_t) + sizeof(KeyType) + sizeof(ValueType);
 
     LogEntry entry {
         .lsn_ = lsn_counter_.fetch_add(1),
         .type_ = LogType::SlotUpdate,
         .pos_ = pos,
-        .size_ = sizeof(int) + sizeof(KEYPAIR_TYPE)
+        .size_ = payload_size
     };
 
-    append_bytes(&slot_idx, sizeof(int));
-    append_bytes(&kp, sizeof(KEYPAIR_TYPE));
+    append_bytes(&entry, sizeof(LogEntry));
+    append_bytes(&slot_idx, sizeof(slot_idx));
+    append_bytes(&key, sizeof(KeyType));
+    append_bytes(&val, sizeof(ValueType));
 }
 
-/* Update a range of slots in one page. Expensive. (Depends on slot_count.) */
 LOGMANAGER_TEMPLATE_ARGS
-void LOGMANAGER_TYPE::append_slot_range_init(diskpos_t pos, int slot_start, int slot_count, bool is_leaf, const PAGE_TYPE& page) {
+void LOGMANAGER_TYPE::append_slot_range_init(diskpos_t pos, uint16_t count,
+                                              bool is_leaf,
+                                              const PAGE_TYPE& src_page) {
     if (!USE_WAL) return;
+    if (count == 0) return;
     std::lock_guard<std::mutex> lock(log_mtx_);
+
+    size_t payload_size = sizeof(uint16_t) + sizeof(uint8_t);
+    payload_size += static_cast<size_t>(count) * sizeof(KeyType);
+    payload_size += static_cast<size_t>(count) * sizeof(ValueType);
+    if (!is_leaf) {
+        payload_size += static_cast<size_t>(count) * sizeof(diskpos_t);
+    }
 
     LogEntry entry {
         .lsn_ = lsn_counter_.fetch_add(1),
         .type_ = LogType::SlotRangeInit,
         .pos_ = pos,
-        .size_ = sizeof(int) * 2 + sizeof(bool) + sizeof(KEYPAIR_TYPE) * slot_count + sizeof(diskpos_t) * (is_leaf ? 0 : slot_count)
+        .size_ = payload_size
     };
 
-    append_bytes(&slot_start, sizeof(int));
-    append_bytes(&slot_count, sizeof(int));
-    append_bytes(&is_leaf, sizeof(bool));
-    for (int i = 0; i < slot_count; i++) {
-        append_bytes(&page.data_[i + slot_start], sizeof(KEYPAIR_TYPE));
+    const uint8_t is_leaf_byte = is_leaf ? 1 : 0;
+
+    append_bytes(&entry, sizeof(LogEntry));
+    append_bytes(&count, sizeof(count));
+    append_bytes(&is_leaf_byte, sizeof(is_leaf_byte));
+
+    for (uint16_t i = 0; i < count; ++i) {
+        append_bytes(&src_page.data_[i], sizeof(KeyType));
     }
-    if (is_leaf) return;
-    for (int i = 0; i < slot_count; i++) {
-        append_bytes(&page.ch_[i + slot_start], sizeof(diskpos_t));
+    for (uint16_t i = 0; i < count; ++i) {
+        append_bytes(&src_page.data_[i].val_, sizeof(ValueType));
+    }
+    if (!is_leaf) {
+        for (uint16_t i = 0; i < count; ++i) {
+            append_bytes(&src_page.ch_[i], sizeof(diskpos_t));
+        }
     }
 }
 
-/* Update metadata of one page. Cheap. */
-LOGMANAGER_TEMPLATE_ARGS
-void LOGMANAGER_TYPE::append_meta_update(diskpos_t pos, uint64_t mask, const PAGE_TYPE& page) {
-    if (!USE_WAL) return;
-    std::lock_guard<std::mutex> lock(log_mtx_);
-
-    LogEntry entry {
-        .lsn_ = lsn_counter_.fetch_add(1),
-        .type_ = LogType::SlotRangeInit,
-        .pos_ = pos,
-        .size_ = 8 + 8 * __builtin_popcount(mask)
-    };
-
-    append_bytes(&mask, 8);
-    if (mask & (1 << 4)) {
-        // Type update
-        uint64_t type = static_cast<uint64_t>(&page.type_);
-        append_bytes(&type, 8);
-    }
-    if (mask & (1 << 3)) {
-        // Parent update
-        append_bytes(&page.fa_, 8);
-    }
-    if (mask & (1 << 2)) {
-        // Left update
-        append_bytes(&page.left_, 8);
-    }
-    if (mask & (1 << 1)) {
-        // Right update
-        append_bytes(&page.right_, 8);
-    }
-    if (mask & 1) {
-        // Size update
-        append_bytes(&page.size_, 8);
-    }
-}
- 
 LOGMANAGER_TEMPLATE_ARGS
 void LOGMANAGER_TYPE::flush() {
     if (!USE_WAL) return;
@@ -273,7 +321,9 @@ void LOGMANAGER_TYPE::flush() {
 
         size_t offset = 0;
         while (offset < buffer_.size()) {
-            ssize_t written = write(fd_, reinterpret_cast<const char*>(buffer_.data() + offset), buffer_.size() - offset);
+            ssize_t written = write(fd_,
+                reinterpret_cast<const char*>(buffer_.data() + offset),
+                buffer_.size() - offset);
             if (written <= 0) {
                 throw std::runtime_error("WAL file write error");
             }
@@ -308,243 +358,274 @@ void LOGMANAGER_TYPE::recover(const std::string& file_name) {
     DiskManager<PAGE_TYPE, diskpos_t, 12, false> disk;
     disk.initialise(file_name);
 
+    std::unordered_map<diskpos_t, PAGE_TYPE> page_cache;
+
+    auto read_exact = [&](void *dst, size_t size) -> bool {
+        wal.read(reinterpret_cast<char *>(dst),
+                 static_cast<std::streamsize>(size));
+        return wal.gcount() == static_cast<std::streamsize>(size);
+    };
+
+    auto skip_bytes = [&](size_t bytes) {
+        wal.seekg(static_cast<std::streamoff>(bytes), std::ios::cur);
+    };
+
+    auto meta_payload_size = [](uint8_t mask) -> size_t {
+        size_t sz = 1;
+        if (mask & MetaField::SIZE)  sz += sizeof(size_t);
+        if (mask & MetaField::LEFT)  sz += sizeof(diskpos_t);
+        if (mask & MetaField::RIGHT) sz += sizeof(diskpos_t);
+        if (mask & MetaField::FA)    sz += sizeof(diskpos_t);
+        if (mask & MetaField::TYPE)  sz += sizeof(PageType);
+        return sz;
+    };
+
+    auto slot_range_payload_size = [](uint16_t count, bool is_leaf) -> size_t {
+        size_t sz = sizeof(uint16_t) + sizeof(uint8_t);
+        sz += static_cast<size_t>(count) * sizeof(KeyType);
+        sz += static_cast<size_t>(count) * sizeof(ValueType);
+        if (!is_leaf) {
+            sz += static_cast<size_t>(count) * sizeof(diskpos_t);
+        }
+        return sz;
+    };
+
+    auto load_page = [&](diskpos_t pos) -> PAGE_TYPE* {
+        auto it = page_cache.find(pos);
+        if (it != page_cache.end()) return &it->second;
+        PAGE_TYPE pg;
+        disk.read(pg, pos);
+        auto [iter, _] = page_cache.emplace(pos, std::move(pg));
+        return &iter->second;
+    };
+
+    constexpr size_t kHeaderSize = sizeof(LogEntry);
+
     while (wal.good()) {
         LogEntry entry;
-        wal.read(reinterpret_cast<char*>(&entry), sizeof(LogEntry));
+        wal.read(reinterpret_cast<char*>(&entry), kHeaderSize);
         std::streamsize header_bytes = wal.gcount();
-        if (header_bytes == 0) {
-            break;
-        }
-        if (header_bytes != sizeof(LogEntry)) {
-            break;
-        }
+        if (header_bytes == 0) break;
+        if (header_bytes != static_cast<std::streamsize>(kHeaderSize)) break;
 
-        bool bad = false;
         switch (entry.type_) {
-            case LogType::PageInit: {
-                if (entry.size_ != sizeof(PAGE_TYPE)) {
-                    throw std::runtime_error("WAL recovery: invalid page payload size");
-                }
-                PAGE_TYPE page;
-                wal.read(reinterpret_cast<char*>(&page), sizeof(PAGE_TYPE));
-                if (wal.gcount() != sizeof(PAGE_TYPE)) {
-                    bad = true;
-                    break;
-                }
-                disk.update(page, entry.pos_);
-                break;
+
+        case LogType::PageUpdate: {
+            if (entry.size_ != sizeof(PAGE_TYPE)) {
+                throw std::runtime_error("WAL recovery: PageUpdate has invalid size");
             }
-
-            case LogType::RootUpdate: {
-                if (entry.size_ != 0) {
-                    throw std::runtime_error("WAL recovery: invalid root payload size");
-                }
-                diskpos_t root = entry.pos_;
-                disk.write_info(root, 2);
-                break;
-            }
-
-            case LogType::SlotInsert: {
-                if (entry.size_ != sizeof(int) + sizeof(diskpos_t) + sizeof(KEYPAIR_TYPE)) {
-                    throw std::runtime_error("WAL recovery: invalid page payload size");
-                }
-                int slot_idx;
-                diskpos_t child_pos;
-                KEYPAIR_TYPE kp;
-                wal.read(reinterpret_cast<char*>(&slot_idx), sizeof(int));
-                if (wal.gcount() != sizeof(int)) {
-                    bad = true;
-                    break;
-                }
-                wal.read(reinterpret_cast<char*>(&child_pos), sizeof(diskpos_t));
-                if (wal.gcount() != sizeof(diskpos_t)) {
-                    bad = true;
-                    break;
-                }
-                wal.read(reinterpret_cast<char*>(&kp), sizeof(KEYPAIR_TYPE));
-                if (wal.gcount() != sizeof(KEYPAIR_TYPE)) {
-                    bad = true;
-                    break;
-                }
-                PAGE_TYPE page;
-                disk.read(page, entry.pos_);
-                for (int i = page.size_ - 1; i >= slot_idx; i--) {
-                    page.data_[i + 1] = page.data_[i];
-                    page.ch_[i + 1] = page.ch_[i];
-                }
-                page.data_[slot_idx] = kp;
-                page.ch_[slot_idx] = child_pos;
-                page.size_++;
-                disk.update(page, entry.pos_);
-                break;
-            }
-
-            case LogType::SlotDelete: {
-                if (entry.size_ != sizeof(int)) {
-                    throw std::runtime_error("WAL recovery: invalid page payload size");
-                }
-                int slot_idx;
-                wal.read(reinterpret_cast<char*>(slot_idx), sizeof(int));
-                if (wal.gcount() != sizeof(int)) {
-                    bad = true;
-                    break;
-                }
-                PAGE_TYPE page;
-                disk.read(page, entry.pos_);
-                for (int i = slot_idx; i < page.size_ - 1; i++) {
-                    page.data_[i] = page.data_[i + 1];
-                    page.ch_[i] = page.ch_[i + 1];
-                }
-                page.size_--;
-                disk.update(page, entry.pos_);
-                break;
-            }
-
-            case LogType::SlotUpdate: {
-                if (entry.size_ != sizeof(int) + sizeof(KEYPAIR_TYPE)) {
-                    throw std::runtime_error("WAL recovery: invalid page payload size");
-                }
-                int slot_idx;
-                KEYPAIR_TYPE kp;
-                wal.read(reinterpret_cast<char*>(&slot_idx), sizeof(int));
-                if (wal.gcount() != sizeof(int)) {
-                    bad = true;
-                    break;
-                }
-                wal.read(reinterpret_cast<char*>(&kp), sizeof(KEYPAIR_TYPE));
-                if (wal.gcount() != sizeof(KEYPAIR_TYPE)) {
-                    bad = true;
-                    break;
-                }
-                PAGE_TYPE page;
-                disk.read(page, entry.pos_);
-                page.data_[slot_idx] = kp;
-                disk.update(page, entry.pos_);
-                break;
-            }
-
-            case LogType::SlotRangeInit: {
-                int slot_start, slot_count;
-                bool is_leaf;
-                wal.read(reinterpret_cast<char*>(slot_start), sizeof(int));
-                if (wal.gcount() != sizeof(int)) {
-                    bad = true;
-                    break;
-                }
-                wal.read(reinterpret_cast<char*>(slot_count), sizeof(int));
-                if (wal.gcount() != sizeof(int)) {
-                    bad = true;
-                    break;
-                }
-                wal.read(reinterpret_cast<char*>(is_leaf), sizeof(bool));
-                if (wal.gcount() != sizeof(bool)) {
-                    bad = true;
-                    break;
-                }
-                int expected_size = sizeof(int) * 2 + sizeof(bool) + sizeof(KEYPAIR_TYPE) * slot_count + sizeof(diskpos_t) * (is_leaf ? 0 : slot_count);
-                if (expected_size != entry.size_) {
-                    throw std::runtime_error("WAL recovery: invalid page payload size");
-                }
-                PAGE_TYPE new_page;
-                for (int i = 0; i < slot_count; i++) {
-                    wal.read(reinterpret_cast<char*>(&new_page.data_[i + slot_start]), sizeof(KEYPAIR_TYPE));
-                    if (wal.gcount() != sizeof(KEYPAIR_TYPE)) {
-                        bad = true;
-                    break;
-                    }
-                }
-                if (!is_leaf) {
-                    for (int i = 0; i < slot_count; i++) {
-                        wal.read(reinterpret_cast<char*>(&new_page.ch_[i + slot_start]), sizeof(diskpos_t));
-                        if (wal.gcount() != sizeof(diskpos_t)) {
-                            bad = true;
-                    break;
-                        }
-                    }
-                }
-                PAGE_TYPE page;
-                disk.read(page, entry.pos_);
-                for (int i = 0; i < slot_count; i++) {
-                    page.data_[i + slot_start] = new_page.data_[i + slot_start];
-                    if (!is_leaf) {
-                        page.ch_[i + slot_start] = new_page.ch_[i + slot_start];
-                    }
-                }
-                disk.update(page, entry.pos_);
-                break;
-            }
-
-            case LogType::MetaUpdate: {
-                int mask, temp;
-                wal.read(reinterpret_cast<char*>(&mask), 8);
-                if (wal.gcount() != 8) {
-                    bad = true;
-                    break;
-                }
-                if (entry.size_ != 8 + 8 * __builtin_popcount(mask)) {
-                    throw std::runtime_error("WAL recovery: invalid page payload size");
-                }
-                PAGE_TYPE page;
-                disk.read(page, entry.pos_);
-                if (mask & (1 << 4)) {
-                    wal.read(reinterpret_cast<char*>(&temp), 8);
-                    if (wal.gcount() != 8) {
-                        bad = true;
-                    break;
-                    }
-                    if (temp == 1) {
-                        page.type_ = PageType::Leaf;
-                    }
-                    else if (temp == 2) {
-                        page.type_ = PageType::Internal;
-                    }
-                }
-                if (mask & (1 << 3)) {
-                    wal.read(reinterpret_cast<char*>(&temp), 8);
-                    if (wal.gcount() != 8) {
-                        bad = true;
-                    break;
-                    }
-                    page.fa_ = temp;
-                }
-                if (mask & (1 << 2)) {
-                    wal.read(reinterpret_cast<char*>(&temp), 8);
-                    if (wal.gcount() != 8) {
-                        bad = true;
-                    break;
-                    }
-                    page.left_ = temp;
-                }
-                if (mask & (1 << 1)) {
-                    wal.read(reinterpret_cast<char*>(&temp), 8);
-                    if (wal.gcount() != 8) {
-                        bad = true;
-                    break;
-                    }
-                    page.right_ = temp;
-                }
-                if (mask & 1) {
-                    wal.read(reinterpret_cast<char*>(&temp), 8);
-                    if (wal.gcount() != 8) {
-                        bad = true;
-                    break;
-                    }
-                    page.size_ = temp;
-                }
-                disk.update(page, entry.pos_);
-                break;
-            }
-
-            default:
-                throw std::runtime_error("WAL recovery: unknown log type");
-        }
-
-        if (bad) {
+            PAGE_TYPE page;
+            if (!read_exact(&page, sizeof(PAGE_TYPE))) break;
+            page.page_lsn_ = entry.lsn_;
+            disk.update(page, entry.pos_);
             break;
         }
+
+        case LogType::RootUpdate: {
+            if (entry.size_ != 0) {
+                throw std::runtime_error("WAL recovery: RootUpdate has invalid size");
+            }
+            diskpos_t root = entry.pos_;
+            disk.write_info(root, 2);
+            break;
+        }
+
+        case LogType::PageInit: {
+            if (entry.size_ != sizeof(PAGE_TYPE)) {
+                throw std::runtime_error("WAL recovery: PageInit has invalid size");
+            }
+            PAGE_TYPE page;
+            if (!read_exact(&page, sizeof(PAGE_TYPE))) break;
+            page.page_lsn_ = entry.lsn_;
+            disk.update(page, entry.pos_);
+            break;
+        }
+
+        case LogType::MetaUpdate: {
+            uint8_t field_mask;
+            if (!read_exact(&field_mask, sizeof(field_mask))) break;
+
+            size_t expected = meta_payload_size(field_mask);
+            if (entry.size_ != expected) {
+                throw std::runtime_error("WAL recovery: MetaUpdate has invalid size");
+            }
+
+            PAGE_TYPE* page_ptr = load_page(entry.pos_);
+            if (page_ptr->page_lsn_ >= entry.lsn_) {
+                skip_bytes( entry.size_ - 1);
+                break;
+            }
+
+            if (field_mask & MetaField::SIZE) {
+                size_t val;
+                if (!read_exact(&val, sizeof(val))) break;
+                page_ptr->size_ = val;
+            }
+            if (field_mask & MetaField::LEFT) {
+                diskpos_t val;
+                if (!read_exact(&val, sizeof(val))) break;
+                page_ptr->left_ = val;
+            }
+            if (field_mask & MetaField::RIGHT) {
+                diskpos_t val;
+                if (!read_exact(&val, sizeof(val))) break;
+                page_ptr->right_ = val;
+            }
+            if (field_mask & MetaField::FA) {
+                diskpos_t val;
+                if (!read_exact(&val, sizeof(val))) break;
+                page_ptr->fa_ = val;
+            }
+            if (field_mask & MetaField::TYPE) {
+                PageType val;
+                if (!read_exact(&val, sizeof(val))) break;
+                page_ptr->type_ = val;
+            }
+
+            page_ptr->page_lsn_ = entry.lsn_;
+            break;
+        }
+
+        case LogType::SlotInsert: {
+            constexpr size_t kFixedSize = sizeof(uint16_t) + sizeof(diskpos_t);
+            constexpr size_t kPayloadSize =
+                kFixedSize + sizeof(KeyType) + sizeof(ValueType);
+            if (entry.size_ != kPayloadSize) {
+                throw std::runtime_error("WAL recovery: SlotInsert has invalid size");
+            }
+
+            PAGE_TYPE* page_ptr = load_page(entry.pos_);
+            if (page_ptr->page_lsn_ >= entry.lsn_) {
+                skip_bytes( kPayloadSize);
+                break;
+            }
+
+            uint16_t slot_idx;
+            diskpos_t child_pos;
+            KeyType key;
+            ValueType val;
+            if (!read_exact(&slot_idx, sizeof(slot_idx))) break;
+            if (!read_exact(&child_pos, sizeof(child_pos))) break;
+            if (!read_exact(&key, sizeof(KeyType))) break;
+            if (!read_exact(&val, sizeof(ValueType))) break;
+
+            for (size_t i = page_ptr->size_; i > slot_idx; --i) {
+                page_ptr->data_[i] = page_ptr->data_[i - 1];
+                page_ptr->ch_[i] = page_ptr->ch_[i - 1];
+            }
+            page_ptr->data_[slot_idx].key_ = key;
+            page_ptr->data_[slot_idx].val_ = val;
+            page_ptr->ch_[slot_idx] = child_pos;
+            page_ptr->size_++;
+
+            page_ptr->page_lsn_ = entry.lsn_;
+            break;
+        }
+
+        case LogType::SlotDelete: {
+            constexpr size_t kPayloadSize = sizeof(uint16_t);
+            if (entry.size_ != kPayloadSize) {
+                throw std::runtime_error("WAL recovery: SlotDelete has invalid size");
+            }
+
+            PAGE_TYPE* page_ptr = load_page(entry.pos_);
+            if (page_ptr->page_lsn_ >= entry.lsn_) {
+                skip_bytes( kPayloadSize);
+                break;
+            }
+
+            uint16_t slot_idx;
+            if (!read_exact( &slot_idx, sizeof(slot_idx))) break;
+
+            for (size_t i = slot_idx; i + 1 < page_ptr->size_; ++i) {
+                page_ptr->data_[i] = page_ptr->data_[i + 1];
+                page_ptr->ch_[i] = page_ptr->ch_[i + 1];
+            }
+            page_ptr->size_--;
+
+            page_ptr->page_lsn_ = entry.lsn_;
+            break;
+        }
+
+        case LogType::SlotUpdate: {
+            constexpr size_t kPayloadSize =
+                sizeof(uint16_t) + sizeof(KeyType) + sizeof(ValueType);
+            if (entry.size_ != kPayloadSize) {
+                throw std::runtime_error("WAL recovery: SlotUpdate has invalid size");
+            }
+
+            PAGE_TYPE* page_ptr = load_page(entry.pos_);
+            if (page_ptr->page_lsn_ >= entry.lsn_) {
+                skip_bytes( kPayloadSize);
+                break;
+            }
+
+            uint16_t slot_idx;
+            KeyType key;
+            ValueType val;
+            if (!read_exact(&slot_idx, sizeof(slot_idx))) break;
+            if (!read_exact(&key, sizeof(KeyType))) break;
+            if (!read_exact(&val, sizeof(ValueType))) break;
+
+            page_ptr->data_[slot_idx].key_ = key;
+            page_ptr->data_[slot_idx].val_ = val;
+
+            page_ptr->page_lsn_ = entry.lsn_;
+            break;
+        }
+
+        case LogType::SlotRangeInit: {
+            uint16_t count;
+            uint8_t is_leaf_byte;
+            if (!read_exact(&count, sizeof(count))) break;
+            if (!read_exact(&is_leaf_byte, sizeof(is_leaf_byte))) break;
+
+            const bool is_leaf = (is_leaf_byte != 0);
+            size_t expected = slot_range_payload_size(count, is_leaf);
+            if (entry.size_ != expected) {
+                throw std::runtime_error("WAL recovery: SlotRangeInit has invalid size");
+            }
+
+            PAGE_TYPE* page_ptr = load_page(entry.pos_);
+            if (page_ptr->page_lsn_ >= entry.lsn_) {
+                size_t remaining = entry.size_ - sizeof(count) - sizeof(is_leaf_byte);
+                skip_bytes( remaining);
+                break;
+            }
+
+            const size_t base = page_ptr->size_;
+            for (size_t i = 0; i < count; ++i) {
+                if (!read_exact(&page_ptr->data_[base + i].key_, sizeof(KeyType))) break;
+            }
+            for (size_t i = 0; i < count; ++i) {
+                if (!read_exact(&page_ptr->data_[base + i].val_, sizeof(ValueType))) break;
+            }
+            if (!is_leaf) {
+                for (size_t i = 0; i < count; ++i) {
+                    if (!read_exact(&page_ptr->ch_[base + i], sizeof(diskpos_t))) break;
+                }
+            }
+
+            page_ptr->size_ += count;
+            page_ptr->page_lsn_ = entry.lsn_;
+            break;
+        }
+
+        default: {
+            if (entry.size_ > 0) {
+                skip_bytes( entry.size_);
+            }
+            break;
+        }
+
+        } // switch
     }
 
     wal.close();
+
+    for (auto &kv : page_cache) {
+        disk.update(kv.second, kv.first);
+    }
 
     if (std::remove(wal_file.c_str()) != 0) {
         throw std::runtime_error("WAL recovery: failed to remove WAL file");
