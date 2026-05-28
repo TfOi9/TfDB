@@ -107,6 +107,9 @@ LOGMANAGER_TYPE::~LogManager() {
     if (fd_ != -1) {
         close(fd_);
     }
+    if (!file_name_.empty()) {
+        std::remove(file_name_.c_str());
+    }
 }
 
 LOGMANAGER_TEMPLATE_ARGS
